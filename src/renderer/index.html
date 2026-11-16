@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>TermDock</title>
+  <link rel="stylesheet" href="./renderer.css">
+  <script src="./renderer.js" defer></script>
+</head>
+<body>
+  <header class="titlebar">
+    <span class="brand-mark" aria-hidden="true">&gt;_</span><strong>TermDock</strong>
+    <span class="title-divider"></span><span class="title-description">终端工作台</span>
+  </header>
+  <main class="workbench">
+    <aside id="session-sidebar" class="sidebar" aria-label="会话管理">
+      <div class="sidebar-top">
+        <h1>会话</h1>
+        <button id="new-profile" class="icon-button" title="新建已保存的会话" aria-label="新建已保存的会话">＋</button>
+      </div>
+      <div class="quick">
+        <button id="quick-serial" class="primary"><span class="symbol">⌁</span> 串口</button>
+        <button id="quick-ssh"><span class="symbol">&gt;_</span> SSH</button>
+        <button id="quick-local"><span class="symbol" aria-hidden="true">&gt;_</span> 本机 PowerShell</button>
+      </div>
+      <input id="session-search" type="search" aria-label="搜索已保存会话" placeholder="搜索会话">
+      <div class="sidebar-lists">
+        <section aria-labelledby="saved-heading">
+          <div class="sidebar-heading"><span id="saved-heading">已保存会话</span><span id="profile-count"></span></div>
+          <div id="profiles" class="profiles"></div>
+        </section>
+        <section aria-labelledby="recent-heading">
+          <div class="sidebar-heading"><span id="recent-heading">最近连接</span></div>
+          <div id="recent-connections" class="profiles"></div>
+        </section>
+      </div>
+      <div class="sidebar-bottom">
+        <button id="all-logs"><span aria-hidden="true">▤</span> 日志目录</button>
+        <button id="settings"><span aria-hidden="true">⚙</span> 终端设置</button>
+      </div>
+    </aside>
+    <section class="workspace" aria-label="终端工作区">
+      <div class="tabs-bar">
+        <button id="sidebar-toggle" type="button" aria-controls="session-sidebar" aria-expanded="true" aria-label="收起会话栏" title="收起会话栏">
+          <span class="sidebar-toggle-icon" aria-hidden="true"></span>
+        </button>
+        <div id="tabs" class="tabs" role="tablist" aria-label="打开的会话"></div>
+        <span id="tabs-empty">终端</span>
+      </div>
+      <div class="workspace-toolbar" role="toolbar" aria-label="会话工具栏">
+        <button id="local-options" type="button">本机 Shell…</button>
+        <button id="split-side" type="button" aria-pressed="false">左右分屏</button>
+        <button id="split-stack" type="button" aria-pressed="false">上下分屏</button>
+        <button id="import-profiles" type="button">导入会话…</button>
+        <input id="import-profile-file" type="file" accept=".json,application/json" hidden>
+      </div>
+      <div id="empty" class="empty">
+        <div class="empty-inner">
+          <div class="terminal-mark" aria-hidden="true"><span></span><span></span><span></span><b>&gt;_</b></div>
+          <h2>打开一个终端</h2>
+          <p>连接串口或 SSH，或打开本机 PowerShell。</p>
+          <div class="empty-actions">
+            <button id="empty-serial" class="primary">连接串口</button>
+            <button id="empty-ssh">连接 SSH</button>
+            <button id="empty-local">打开 PowerShell</button>
+          </div>
+        </div>
+      </div>
+      <div id="surfaces"></div>
+    </section>
+    <div id="notice" class="notice" role="alert" hidden><span></span><button aria-label="关闭通知">×</button></div>
+  </main>
+  <section class="command-bar" aria-label="命令按钮栏">
+    <div class="command-bar-tools">
+      <select id="command-group" aria-label="命令分组" disabled><option>命令分组</option></select>
+      <button id="manage-commands" type="button">管理按钮</button>
+    </div>
+    <fieldset id="command-buttons" disabled>
+      <div id="command-button-list"></div>
+    </fieldset>
+  </section>
+  <footer class="statusbar">
+    <i id="global-dot" class="status-dot"></i><span id="global-state">无活动连接</span>
+    <span id="global-endpoint" class="muted"></span>
+    <span class="status-spacer"></span><span id="global-size"></span><span id="global-renderer"></span>
+  </footer>
+
+  <dialog id="connect-dialog">
+    <form id="connect-form">
+      <div class="dialog-head"><h2 id="connect-title">连接</h2><button type="button" data-dismiss aria-label="关闭">×</button></div>
+      <div class="dialog-body">
+        <div class="form-grid">
+          <label>类型<select id="kind" name="kind"><option value="serial">串口</option><option value="ssh">SSH</option></select></label>
+          <label>会话名称<input name="name" maxlength="80" required></label>
+        </div>
+        <fieldset id="serial-fields">
+          <div class="section-title">串口参数</div>
+          <div class="form-grid">
+            <label>分组<input name="group" maxlength="80"></label>
+            <label class="check"><input type="checkbox" name="favorite"> 收藏会话</label>
+          </div>
+          <label>关键词高亮<input name="keywords" maxlength="1024" placeholder="用逗号分隔，例如 ERROR, Kernel panic"></label>
+          <div class="form-grid">
+            <label>COM 口<span class="input-group"><input name="path" list="ports" placeholder="请选择 COM 口" autocomplete="off"><button type="button" id="refresh-ports">刷新</button></span></label>
+            <datalist id="ports"></datalist>
+            <label>波特率<input name="baudRate" type="number" min="50" max="12000000" list="baud-rates"></label>
+            <datalist id="baud-rates"><option>9600</option><option>57600</option><option>115200</option><option>460800</option><option>921600</option><option>1500000</option></datalist>
+            <label>数据位<select name="dataBits"><option>8</option><option>7</option><option>6</option><option>5</option></select></label>
+            <label>校验位<select name="parity"><option value="none">无</option><option value="even">偶校验</option><option value="odd">奇校验</option><option value="mark">Mark</option><option value="space">Space</option></select></label>
+            <label>停止位<select name="stopBits"><option>1</option><option>1.5</option><option>2</option></select></label>
+            <label>流控<select name="flow"><option value="software">XON/XOFF</option><option value="hardware">RTS/CTS</option><option value="none">无</option></select></label>
+            <label>终端行尾<select name="inputEnding"><option>CR</option><option>LF</option><option>CRLF</option></select></label>
+            <label class="check"><input type="checkbox" name="localEcho"> 本地回显</label>
+          </div>
+          <div class="section-title">串口日志</div>
+          <div class="log-fields">
+            <label>保存位置<span class="input-group"><input name="logDirectory" readonly placeholder="%APPDATA%\TermDock\logs"><button type="button" id="pick-log-directory">浏览</button><button type="button" id="reset-log-directory" disabled>默认</button></span></label>
+            <label>日志格式<select name="logFormat"><option value="timestamped">每行加毫秒时间戳</option><option value="raw">原始日志（无时间戳）</option></select></label>
+          </div>
+        </fieldset>
+        <fieldset id="ssh-fields" hidden>
+          <div class="section-title">远程服务器</div>
+          <div class="form-grid host-grid">
+            <label>主机<input name="host" placeholder="主机名或 IP" spellcheck="false"></label>
+            <label>端口<input name="port" type="number" min="1" max="65535"></label>
+            <label class="full">用户名<input name="username" autocomplete="username"></label>
+          </div>
+          <div id="auth-fields">
+            <div class="section-title">本次连接的认证</div>
+            <label>认证方式<select name="method"><option value="password">密码</option><option value="key">私钥</option><option value="agent">SSH Agent</option></select></label>
+            <label id="password-fields">密码<input name="password" type="password" autocomplete="off"></label>
+            <div id="key-fields" hidden>
+              <label>私钥文件<span class="input-group"><input name="privateKey" readonly><button type="button" id="pick-key">浏览</button></span></label>
+              <label>私钥口令<input name="passphrase" type="password" autocomplete="off" placeholder="未加密可留空"></label>
+            </div>
+          </div>
+        </fieldset>
+        <p id="connect-error" class="form-error" role="alert" hidden></p>
+      </div>
+      <div class="dialog-actions">
+        <button id="delete-profile" type="button" class="danger" hidden>删除</button>
+        <span class="status-spacer"></span>
+        <button type="button" data-dismiss>取消</button>
+        <button id="save-profile" type="submit" value="save">保存</button>
+        <button id="connect-now" type="submit" value="connect" class="primary">连接</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="key-dialog">
+    <div class="dialog-head"><h2>确认 SSH 主机密钥</h2></div>
+    <div class="dialog-body">
+      <p>请通过可信渠道核对 <b id="key-host"></b> 的指纹。确认后，TermDock 会记住此主机密钥。</p>
+      <output id="key-fingerprint" class="fingerprint"></output>
+    </div>
+    <div class="dialog-actions"><span class="status-spacer"></span><button id="reject-key">拒绝</button><button id="accept-key" class="primary">信任并连接</button></div>
+  </dialog>
+
+  <dialog id="forward-dialog">
+    <div class="dialog-head"><h2>SSH 本地端口转发</h2><button type="button" data-dismiss aria-label="关闭">×</button></div>
+    <div class="dialog-body">
+      <form id="forward-form">
+        <div class="form-grid">
+          <label>本地回环端口<input name="localPort" type="number" min="0" max="65535" value="0" required></label>
+          <label>目标端口<input name="port" type="number" min="1" max="65535" required></label>
+          <label class="full">SSH 服务器可访问的目标主机<input name="host" value="127.0.0.1" required></label>
+        </div>
+        <button type="submit">开始转发</button>
+      </form>
+      <div id="active-forwards" aria-label="已启动的转发"></div>
+      <p id="forward-status" role="status"></p>
+    </div>
+  </dialog>
+  <dialog id="sftp-dialog">
+    <div class="dialog-head"><h2>SFTP</h2><button type="button" data-dismiss aria-label="关闭">×</button></div>
+    <div class="dialog-body">
+      <form id="sftp-path-form" class="sftp-path-row">
+        <input id="sftp-path" aria-label="远程目录" value="." required maxlength="4096">
+        <button type="submit">转到</button>
+        <button type="button" id="sftp-parent">上级</button>
+        <button type="button" id="sftp-upload">上传</button>
+      </form>
+      <div id="sftp-entries" aria-label="远程文件"></div>
+      <p id="sftp-status" role="status"></p>
+    </div>
+  </dialog>
+  <dialog id="local-dialog">
+    <form id="local-form">
+      <div class="dialog-head"><h2>本机 Shell</h2><button type="button" data-dismiss aria-label="关闭">×</button></div>
+      <div class="dialog-body form-grid">
+        <label>Shell<select name="shell"><option value="powershell">Windows PowerShell</option><option value="cmd">CMD</option><option value="pwsh">PowerShell 7</option><option value="wsl">WSL</option></select></label>
+        <label>工作目录<input name="cwd" placeholder="默认使用用户主目录"></label>
+        <label>环境变量<textarea name="environment" rows="4" placeholder="每行一个 NAME=value"></textarea></label>
+      </div>
+      <div class="dialog-actions"><span class="status-spacer"></span><button type="button" data-dismiss>取消</button><button type="submit" class="primary">打开 Shell</button></div>
+    </form>
+  </dialog>
+  <dialog id="settings-dialog">
+    <form id="settings-form">
+      <div class="dialog-head"><h2>终端设置</h2><button type="button" data-dismiss aria-label="关闭">×</button></div>
+      <div class="dialog-body form-grid">
+        <label>字体<select name="font"><option value="macOS">macOS 风格</option><option>Cascadia Mono</option><option>Consolas</option><option>Lucida Console</option><option>monospace</option></select></label>
+        <label>字号<input name="fontSize" type="number" min="9" max="36" required></label>
+        <label>回滚行数<input name="scrollback" type="number" min="100" max="100000" required></label>
+        <label class="check"><input name="gpu" type="checkbox"> WebGL GPU 渲染</label>
+      </div>
+      <div class="dialog-actions"><span class="status-spacer"></span><button type="button" data-dismiss>取消</button><button type="submit" class="primary">应用</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="command-dialog">
+    <form id="command-form" novalidate>
+      <div class="dialog-head"><h2>管理命令按钮</h2><button type="button" data-dismiss aria-label="关闭">×</button></div>
+      <div class="dialog-body">
+        <div class="command-group-controls">
+          <select id="edit-command-group" aria-label="编辑分组"></select>
+          <button id="add-command-group" type="button">新建分组</button>
+          <button id="delete-command-group" type="button" class="danger" disabled>删除分组</button>
+        </div>
+        <fieldset id="command-group-editor" hidden>
+          <label>分组名称<input id="command-group-name" maxlength="60"></label>
+          <div class="command-edit-heading"><span>按钮</span><button id="add-command-button" type="button">添加按钮</button></div>
+          <div id="command-edit-items"></div>
+        </fieldset>
+        <p id="command-form-error" class="form-error" role="alert" hidden></p>
+      </div>
+      <div class="dialog-actions"><span class="status-spacer"></span><button type="button" data-dismiss>取消</button><button id="save-command-groups" type="submit" class="primary">保存</button></div>
+    </form>
+  </dialog>
+  <template id="command-edit-template">
+    <div class="command-edit-row">
+      <input name="name" maxlength="60" placeholder="按钮名称" aria-label="按钮名称">
+      <input name="command" maxlength="4096" placeholder="发送命令" aria-label="发送命令" spellcheck="false">
+      <select name="lineEnding" aria-label="行尾"><option>CR</option><option>LF</option><option>CRLF</option><option value="none">无行尾</option></select>
+      <button type="button" class="danger">删除按钮</button>
+    </div>
+  </template>
+
+  <template id="surface-template">
+    <section class="surface" hidden>
+      <div class="surface-tools">
+        <span class="endpoint"></span><span class="status-spacer"></span>
+        <button class="search-toggle" title="回滚搜索 (Ctrl+Shift+F)">搜索</button>
+        <button class="session-logs" title="打开此会话的日志目录" disabled>日志</button>
+        <button class="record-log" hidden>停止录制</button>
+        <button class="disconnect" hidden>断开</button>
+        <button class="serial-break" hidden>Break</button>
+        <button class="open-sftp" hidden>SFTP</button>
+        <button class="open-forward" hidden>端口转发</button>
+        <button class="reconnect" hidden>重连</button>
+        <button class="timer-toggle">定时发送</button>
+      </div>
+      <div class="surface-body">
+        <div class="terminal-shell">
+          <div class="searchbar" hidden>
+            <input class="search-value" placeholder="搜索终端输出" aria-label="搜索终端输出">
+            <button class="search-prev" aria-label="上一个结果">↑</button>
+            <button class="search-next" aria-label="下一个结果">↓</button>
+            <span class="search-result" aria-live="polite"></span>
+            <button class="search-close" aria-label="关闭搜索">×</button>
+          </div>
+          <div class="terminal-mount"></div>
+        </div>
+        <aside class="timer-panel" aria-label="定时发送">
+          <div class="timer-heading"><h2>定时发送</h2></div>
+          <div class="metrics">
+            <div><span>倒计时</span><strong class="countdown">—</strong></div>
+            <div><span>已发送轮数</span><strong class="rounds">0</strong></div>
+            <div><span>已恢复轮数</span><strong class="recovered-rounds">0</strong></div>
+            <div><span>最近一轮启动标记</span><strong class="boot-marker">—</strong></div>
+          </div>
+          <div class="timer-states">
+            <div><span>命令发送</span><b class="send-state">未开始</b></div>
+            <div><span>Shell 恢复</span><b class="shell-state">未识别</b></div>
+            <p class="timer-detail" hidden></p>
+          </div>
+          <form class="timer-form">
+            <fieldset class="timer-inputs">
+              <label>命令<input name="command" value="reboot" maxlength="1024" required spellcheck="false"></label>
+              <div class="form-grid">
+                <label>间隔（秒）<input name="intervalSeconds" type="number" min="1" max="86400" value="60" required></label>
+                <label>最大轮数<input name="maxRounds" type="number" min="1" max="1000000" placeholder="不限"></label>
+              </div>
+              <label>行尾<select name="lineEnding"><option>CR</option><option>LF</option><option>CRLF</option></select></label>
+              <label class="check"><input type="checkbox" name="waitForShell" checked> 等待 Linux shell 提示符</label>
+              <label>提示符<input name="prompt" maxlength="128" placeholder="自动识别，如 / #、root@board:~#" spellcheck="false"></label>
+            </fieldset>
+            <div class="timer-actions"><button type="submit" class="primary timer-start" disabled>开始</button><button type="button" class="timer-stop" disabled>停止</button></div>
+          </form>
+        </aside>
+      </div>
+    </section>
+  </template>
+</body>
+</html>
