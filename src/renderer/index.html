@@ -22,10 +22,19 @@
       <div class="quick">
         <button id="quick-serial" class="primary"><span class="symbol">⌁</span> 串口</button>
         <button id="quick-ssh"><span class="symbol">&gt;_</span> SSH</button>
-        <button id="quick-local"><span class="symbol" aria-hidden="true">&gt;_</span> 本机 PowerShell</button>
       </div>
       <input id="session-search" type="search" aria-label="搜索已保存会话" placeholder="搜索会话">
       <div class="sidebar-lists">
+        <section aria-labelledby="local-heading">
+          <details class="local-shells" open>
+            <summary id="local-heading">本机 Shell</summary>
+            <button id="quick-local" type="button" data-shell="powershell">Windows PowerShell</button>
+            <button type="button" data-shell="cmd">CMD</button>
+            <button type="button" data-shell="pwsh">PowerShell 7</button>
+            <button type="button" data-shell="wsl">WSL</button>
+            <button id="local-options" type="button">自定义启动…</button>
+          </details>
+        </section>
         <section aria-labelledby="saved-heading">
           <div class="sidebar-heading"><span id="saved-heading">已保存会话</span><span id="profile-count"></span></div>
           <div id="profiles" class="profiles"></div>
@@ -49,11 +58,10 @@
         <span id="tabs-empty">终端</span>
       </div>
       <div class="workspace-toolbar" role="toolbar" aria-label="会话工具栏">
-        <button id="local-options" type="button">本机 Shell…</button>
         <button id="split-side" type="button" aria-pressed="false">左右分屏</button>
         <button id="split-stack" type="button" aria-pressed="false">上下分屏</button>
-        <button id="import-profiles" type="button">导入会话…</button>
-        <input id="import-profile-file" type="file" accept=".json,application/json" hidden>
+        <button id="split-swap" type="button" hidden>交换窗格</button>
+        <button id="split-close" type="button" hidden>关闭分屏</button>
       </div>
       <div id="empty" class="empty">
         <div class="empty-inner">
@@ -63,7 +71,6 @@
           <div class="empty-actions">
             <button id="empty-serial" class="primary">连接串口</button>
             <button id="empty-ssh">连接 SSH</button>
-            <button id="empty-local">打开 PowerShell</button>
           </div>
         </div>
       </div>
@@ -93,14 +100,12 @@
         <div class="form-grid">
           <label>类型<select id="kind" name="kind"><option value="serial">串口</option><option value="ssh">SSH</option></select></label>
           <label>会话名称<input name="name" maxlength="80" required></label>
+          <label>分组<input name="group" maxlength="80"></label>
+          <label class="check"><input type="checkbox" name="favorite"> 收藏会话</label>
+          <label class="full">关键词高亮<input name="keywords" maxlength="1024" placeholder="用逗号分隔，例如 ERROR, Kernel panic"></label>
         </div>
         <fieldset id="serial-fields">
           <div class="section-title">串口参数</div>
-          <div class="form-grid">
-            <label>分组<input name="group" maxlength="80"></label>
-            <label class="check"><input type="checkbox" name="favorite"> 收藏会话</label>
-          </div>
-          <label>关键词高亮<input name="keywords" maxlength="1024" placeholder="用逗号分隔，例如 ERROR, Kernel panic"></label>
           <div class="form-grid">
             <label>COM 口<span class="input-group"><input name="path" list="ports" placeholder="请选择 COM 口" autocomplete="off"><button type="button" id="refresh-ports">刷新</button></span></label>
             <datalist id="ports"></datalist>
@@ -127,9 +132,14 @@
             <label class="full">用户名<input name="username" autocomplete="username"></label>
           </div>
           <div id="auth-fields">
-            <div class="section-title">本次连接的认证</div>
+            <div class="section-title">SSH 认证</div>
             <label>认证方式<select name="method"><option value="password">密码</option><option value="key">私钥</option><option value="agent">SSH Agent</option></select></label>
-            <label id="password-fields">密码<input name="password" type="password" autocomplete="off"></label>
+            <div id="password-fields">
+              <label>密码<input name="password" type="password" autocomplete="new-password"></label>
+              <label class="check"><input type="checkbox" name="rememberPassword">记住密码（仅此 Windows 用户）</label>
+              <label class="check" id="forget-password" hidden><input type="checkbox" name="forgetPassword">清除这个目标的已保存密码</label>
+              <small id="credential-status" role="status"></small>
+            </div>
             <div id="key-fields" hidden>
               <label>私钥文件<span class="input-group"><input name="privateKey" readonly><button type="button" id="pick-key">浏览</button></span></label>
               <label>私钥口令<input name="passphrase" type="password" autocomplete="off" placeholder="未加密可留空"></label>
@@ -145,6 +155,18 @@
         <button id="save-profile" type="submit" value="save">保存</button>
         <button id="connect-now" type="submit" value="connect" class="primary">连接</button>
       </div>
+    </form>
+  </dialog>
+
+  <dialog id="split-dialog">
+    <form id="split-form">
+      <div class="dialog-head"><h2>选择分屏会话</h2></div>
+      <div class="dialog-body form-grid">
+        <label class="full"><span id="split-first-label">左侧</span><select id="split-first" required></select></label>
+        <label class="full"><span id="split-second-label">右侧</span><select id="split-second" required></select></label>
+        <p id="split-error" class="form-error full" role="alert" hidden>请选择两个不同的会话。</p>
+      </div>
+      <div class="dialog-actions"><button type="button" data-dismiss>取消</button><button class="primary" type="submit">应用分屏</button></div>
     </form>
   </dialog>
 
@@ -243,7 +265,8 @@
         <span class="endpoint"></span><span class="status-spacer"></span>
         <button class="search-toggle" title="回滚搜索 (Ctrl+Shift+F)">搜索</button>
         <button class="session-logs" title="打开此会话的日志目录" disabled>日志</button>
-        <button class="record-log" hidden>停止录制</button>
+        <button class="record-log" aria-pressed="true" hidden>停止记录</button>
+        <select class="pane-select" hidden aria-label="更换窗格连接"></select>
         <button class="disconnect" hidden>断开</button>
         <button class="serial-break" hidden>Break</button>
         <button class="open-sftp" hidden>SFTP</button>
@@ -263,7 +286,7 @@
           <div class="terminal-mount"></div>
         </div>
         <aside class="timer-panel" aria-label="定时发送">
-          <div class="timer-heading"><h2>定时发送</h2></div>
+          <div class="timer-heading"><h2>定时发送</h2><button class="timer-collapse" type="button" title="收至右侧">收起 ›</button></div>
           <div class="metrics">
             <div><span>倒计时</span><strong class="countdown">—</strong></div>
             <div><span>已发送轮数</span><strong class="rounds">0</strong></div>
@@ -271,24 +294,41 @@
             <div><span>最近一轮启动标记</span><strong class="boot-marker">—</strong></div>
           </div>
           <div class="timer-states">
+            <div><span>每轮日志</span><b class="round-recording">未记录</b></div>
             <div><span>命令发送</span><b class="send-state">未开始</b></div>
             <div><span>Shell 恢复</span><b class="shell-state">未识别</b></div>
             <p class="timer-detail" hidden></p>
           </div>
           <form class="timer-form">
             <fieldset class="timer-inputs">
-              <label>命令<input name="command" value="reboot" maxlength="1024" required spellcheck="false"></label>
+              <label>运行方式<select name="workflowMode"><option value="single">单条命令</option><option value="steps">多步流程</option></select></label>
+              <label class="legacy-timer-command">命令<input name="command" value="reboot" maxlength="1024" required spellcheck="false"></label>
+              <fieldset class="workflow-steps" hidden disabled>
+                <ol class="workflow-list" aria-label="流程步骤"></ol>
+                <button type="button" class="add-step">＋ 添加步骤</button>
+                <label class="check"><input name="loginEnabled" type="checkbox">启用自动登录</label>
+                <fieldset class="workflow-login" hidden disabled>
+                  <label>登录提示<input name="loginPrompt" value="login:" maxlength="128" required></label>
+                  <label>密码提示<input name="passwordPrompt" value="Password:" maxlength="128" required></label>
+                  <label>用户名<input name="loginUsername" autocomplete="off" required></label>
+                  <label>密码<input name="loginPassword" type="password" autocomplete="new-password" required></label>
+                  <label>提示等待上限（秒）<input name="loginTimeout" type="number" min="1" max="3600" value="60" required></label>
+                  <small>密码仅用于本次任务。每个提示分别计时，登录失败或超时即停止。</small>
+                </fieldset>
+              </fieldset>
+              <label class="check"><input type="checkbox" name="once">仅运行一次（无需等待首轮倒计时）</label>
               <div class="form-grid">
                 <label>间隔（秒）<input name="intervalSeconds" type="number" min="1" max="86400" value="60" required></label>
                 <label>最大轮数<input name="maxRounds" type="number" min="1" max="1000000" placeholder="不限"></label>
               </div>
-              <label>行尾<select name="lineEnding"><option>CR</option><option>LF</option><option>CRLF</option></select></label>
+              <label>单条命令 / 登录行尾<select name="lineEnding"><option>CR</option><option>LF</option><option>CRLF</option></select></label>
               <label class="check"><input type="checkbox" name="waitForShell" checked> 等待 Linux shell 提示符</label>
               <label>提示符<input name="prompt" maxlength="128" placeholder="自动识别，如 / #、root@board:~#" spellcheck="false"></label>
             </fieldset>
             <div class="timer-actions"><button type="submit" class="primary timer-start" disabled>开始</button><button type="button" class="timer-stop" disabled>停止</button></div>
           </form>
         </aside>
+        <button class="timer-expand" type="button" title="展开定时发送" hidden>‹ 定时发送</button>
       </div>
     </section>
   </template>

@@ -230,10 +230,8 @@ async function main() {
     await value('#sftp-status', '下载完成');
     assert.deepEqual(await readFile(copy), payload);
     await sftp.getByRole('button', { name: '关闭', exact: true }).click();
-    const duplicate = await readFile(join(dataDirectory, 'sessions.json'));
-    await page.locator('#import-profile-file').setInputFiles({ name: 'sessions.json', mimeType: 'application/json', buffer: duplicate });
-    await value('#notice span', '已导入 0 个会话');
-    console.log('SFTP list, binary download, upload, and session import deduplication OK');
+    assert.equal(await page.getByRole('button', { name: '导入会话…' }).count(), 0);
+    console.log('SFTP list, binary download, upload, and absence of import entry OK');
     await click('端口转发');
     const forwards = page.locator('#forward-dialog');
     await forwards.locator('[name=port]').fill('8080');
@@ -298,6 +296,27 @@ async function main() {
     await value('.surface:not([hidden]) .xterm-rows', 'MOUSE_READY');
     await surface().locator('.xterm-screen').click({ position: { x: 40, y: 25 } });
     await until(() => Buffer.from(server.inputs).includes('\x1b[<0;'), 'SGR mouse input');
+    const selection = await page.evaluate(() => {
+      const root = document.querySelector('.surface:not([hidden]) .xterm-rows');
+      const texts = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      for (let node = texts.nextNode(); node; node = texts.nextNode()) {
+        const offset = node.textContent.indexOf('MOUSE_READY');
+        if (offset < 0) continue;
+        const range = new Range();
+        range.setStart(node, offset);
+        range.setEnd(node, offset + 'MOUSE_READY'.length);
+        const rect = range.getBoundingClientRect();
+        return { x: rect.left, y: rect.top + rect.height / 2, end: rect.right };
+      }
+    });
+    assert(selection, 'DOM renderer contains the mouse-mode fixture text');
+    await page.keyboard.down('Shift');
+    await page.mouse.move(selection.x + 1, selection.y);
+    await page.mouse.down();
+    await page.mouse.move(selection.end + 1, selection.y, { steps: 10 });
+    await page.mouse.up();
+    await page.keyboard.up('Shift');
+    await until(async () => (await page.evaluate(() => window.termDock.paste())).includes('MOUSE_READY'), 'shift mouse selection auto-copy while mouse reporting is enabled');
     await page.evaluate(() => window.termDock.copy('MOUSE_DISABLE'));
     await press('Control+Shift+v');
     console.log('SSH password, fingerprint, PTY, keys, alternate screen, UTF-8, color, search, clipboard and mouse OK');
@@ -399,11 +418,26 @@ async function main() {
     assert.equal((await sent()).toString(), 'reboot\rroot\rreboot\recho\rreboot\r\n');
     const lastRound = (await readdir(directory)).find(name => name.startsWith('reboot_0003_'));
     assert.deepEqual(await readFile(join(directory, lastRound)), tail);
-    assert.deepEqual(await readFile(join(directory, 'session.log')), Buffer.concat(raw));
+    const segment = /^COM77-\d{8}_\d{6}(?:-\d+)?\.log$/;
+    const segments = async path => (await readdir(path)).filter(name => segment.test(name));
+    const originalSegment = (await segments(directory))[0];
+    assert.deepEqual(await readFile(join(directory, originalSegment)), Buffer.concat(raw));
     const events = await readFile(join(directory, 'events.log'), 'utf8');
     assert.equal((events.match(/\tsent\t/g) || []).length, 3);
     assert.match(events, /test_stopped/);
     console.log('Manual input gating, configurable CRLF, stop and continuous session/round logs OK');
+
+    await click('停止记录');
+    await feed('SESSION_RECORDING_PAUSED\r\n# ');
+    await value('.surface:not([hidden]) .round-recording', '记录中');
+    await until(async () => (await readFile(join(directory, lastRound))).includes('SESSION_RECORDING_PAUSED'), 'round keeps recording during pause');
+    assert.deepEqual(await readFile(join(directory, originalSegment)), Buffer.concat(raw));
+    await click('开始记录');
+    await feed('SESSION_RECORDING_RESUMED\r\n# ');
+    const nextSegment = (await segments(directory)).find(name => name !== originalSegment);
+    assert(nextSegment);
+    await until(async () => (await readFile(join(directory, nextSegment))).toString() === 'SESSION_RECORDING_RESUMED\r\n# ', 'new COM named segment');
+    console.log('Manual serial recording closes the old file while the per-round log continues');
 
     await start();
     await electron.evaluate(() => globalThis.fixture.diskFailure());
@@ -446,7 +480,7 @@ async function main() {
     await value('#global-state', '已连接');
     const [timestampFolder] = await readdir(customRoot);
     const timestampDir = join(customRoot, timestampFolder);
-    const sessionLog = join(timestampDir, 'session.log');
+    const sessionLog = join(timestampDir, (await segments(timestampDir))[0]);
     assert.equal(await surface().locator('.session-logs').getAttribute('title'), timestampDir);
     const timestamp = /\[\d{4}_\d{2}_\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] /g;
     const withoutTimes = text => text.replace(timestamp, '<time>');
@@ -465,10 +499,120 @@ async function main() {
     await until(async () => withoutTimes(await readFile(join(timestampDir, roundLog), 'latin1')) ===
       '<time>CONTINUED\r\n<time>FINAL', 'independent timestamp boundaries in round log');
     assert.equal(await readFile(join(timestampDir, roundLog.replace(/\.log$/, '.raw')), 'latin1'), 'CONTINUED\r\nFINAL');
-    assert.equal(await readFile(join(timestampDir, 'session.raw'), 'latin1'),
+    assert.equal(await readFile(sessionLog.replace(/\.log$/, '.raw'), 'latin1'),
       'FIRST\r\nSECOND\x00\xff\n\nBARE\rNEXT\n# CONTINUED\r\nFINAL');
     assert.equal(withoutTimes(await readFile(sessionLog, 'latin1')), beforeRound + 'CONTINUED\r\n<time>FINAL');
     console.log('Default and custom log paths, saved settings, millisecond prefixes and split line endings OK');
+
+    await timerInput('workflowMode').selectOption('steps');
+    await timerInput('once').check();
+    await timerInput('waitForShell').uncheck();
+    const rows = surface().locator('.workflow-list li');
+    const addStep = async (type, command) => {
+      await surface().locator('.add-step').click();
+      const row = rows.last();
+      await row.locator('.step-type').selectOption(type);
+      if (command) await row.locator('.step-command').fill(command);
+      return row;
+    };
+    await rows.first().locator('.step-command').fill('A');
+    await addStep('send', 'B');
+    await addStep('wait');
+    await rows.last().locator('[data-step=up]').click();
+    await surface().locator('.timer-collapse').click();
+    assert.equal(await surface().locator('.timer-panel').isVisible(), false);
+    await surface().locator('.timer-expand').click();
+    assert.equal(await rows.first().locator('.step-command').inputValue(), 'A');
+    await start();
+    await timerState('已完成');
+    assert((await sent()).toString().endsWith('A\rB\r'));
+    const workflowEvents = join(timestampDir, 'events.log');
+    await until(async () => (await readFile(workflowEvents, 'utf8')).includes('configured_ms=1'), '1 ms delay measurement');
+    const timing = (await readFile(workflowEvents, 'utf8')).split(/\r?\n/).filter(line => /configured_ms=1|step=3\/3 command/.test(line)).slice(-2);
+    console.log('Windows simulated serial timing: ' + timing.map(line => line.split('\t').slice(1).join(' ')).join('; '));
+
+    await rows.first().locator('.step-command').fill('reboot');
+    await rows.nth(1).locator('.step-time').fill('90');
+    await addStep('login');
+    await rows.last().locator('[data-step=up]').click();
+    await addStep('wait');
+    await rows.last().locator('.step-time').fill('0.01');
+    await rows.last().locator('.step-unit').selectOption('s');
+    await rows.last().locator('[data-step=up]').click();
+    await timerInput('loginEnabled').check();
+    const loginSecret = 'example-fixture-login-password';
+    const loginConfig = async () => {
+      await timerInput('loginUsername').fill('serial-user');
+      await timerInput('loginPassword').fill(loginSecret);
+      await timerInput('loginTimeout').fill('1');
+    };
+    const suffix = async (base, expected) =>
+      until(async () => (await sent()).subarray(base).toString() === expected, 'serial workflow writes ' + expected.replace(loginSecret, '(masked)'));
+    const stepState = text => value('.surface:not([hidden]) .timer-detail', text);
+    await loginConfig();
+    await feed('\r\nold login:\r\n# ');
+    await shellState('已就绪');
+    let base = (await sent()).length;
+    await start();
+    await suffix(base, 'reboot\r');
+    await feed('\r\nBL2 fresh boot\r\nboard lo');
+    await feed('gin: ');
+    await suffix(base, 'reboot\rserial-user\r');
+    await feed('\r\nPass');
+    await feed('word: ');
+    await suffix(base, 'reboot\rserial-user\r' + loginSecret + '\r');
+    await stepState('凭据已写入');
+    await feed(loginSecret.slice(0, 9));
+    await feed(loginSecret.slice(9) + '\r\n# ');
+    await suffix(base, 'reboot\rserial-user\r' + loginSecret + '\rB\r');
+    await timerState('已完成');
+    for (const file of (await readdir(timestampDir)).filter(name => name.endsWith('.log') || name.endsWith('.raw'))) {
+      assert(!(await readFile(join(timestampDir, file))).includes(loginSecret), file);
+    }
+    assert.match(await readFile(workflowEvents, 'utf8'), /login_confirmed/);
+    await loginConfig();
+    base = (await sent()).length;
+    await start();
+    await suffix(base, 'reboot\r');
+    await stepState('等待本轮登录提示');
+    await feed('\r\n# ');
+    await timerState('异常停止');
+    await stepState('等待登录提示超时');
+    assert.equal((await sent()).subarray(base).toString(), 'reboot\r');
+
+    await loginConfig();
+    base = (await sent()).length;
+    await start();
+    await suffix(base, 'reboot\r');
+    await feed('\r\nboard login: ');
+    await suffix(base, 'reboot\rserial-user\r');
+    await feed('\r\nPassword: ');
+    await suffix(base, 'reboot\rserial-user\r' + loginSecret + '\r');
+    await feed('\r\nLogin incorrect\r\nboard login: ');
+    await timerState('异常停止');
+    await stepState('设备拒绝登录');
+    assert.equal((await sent()).subarray(base).toString(), 'reboot\rserial-user\r' + loginSecret + '\r');
+
+    await timerInput('loginEnabled').uncheck();
+    await feed('\r\n# ');
+    await shellState('已就绪');
+    base = (await sent()).length;
+    await start();
+    await suffix(base, 'reboot\rB\r');
+    await timerState('已完成');
+    assert.match(await readFile(workflowEvents, 'utf8'), /login_skipped/);
+
+    await rows.nth(1).locator('.step-time').fill('5500');
+    base = (await sent()).length;
+    await start();
+    await suffix(base, 'reboot\r');
+    await stepState('等待 5500 ms');
+    await stop();
+    await timerState('已停止');
+    await sleep(250);
+    assert.equal((await sent()).subarray(base).toString(), 'reboot\r');
+    const serialBeforeCommands = (await sent()).length;
+    console.log('Workflow steps, early and fragmented prompts, redacted echo, timeout, rejection, skip and stop OK');
 
     for (let index = 3; index <= 6; index++) {
       await sshFields();
@@ -496,7 +640,7 @@ async function main() {
     await press('Alt+1');
     assert.equal(await selected(), 'SSH 6');
     assert.equal(server.inputs.length, inputCount);
-    assert.equal((await sent()).toString(), 'reboot\r');
+    assert.equal((await sent()).length, serialBeforeCommands);
     console.log('Six live sessions, mouse drag swap and Alt shortcuts in display order OK');
 
     const shellSizes = server.shellInputs.map(bytes => bytes.length);
@@ -504,11 +648,11 @@ async function main() {
     await until(() => Buffer.from(server.shellInputs.at(-1)).subarray(shellSizes.at(-1)).toString() === 'uname -a\n',
       'command button sends LF only to the active SSH shell');
     assert.deepEqual(server.shellInputs.slice(0, -1).map(bytes => bytes.length), shellSizes.slice(0, -1));
-    assert.equal((await sent()).toString(), 'reboot\r');
+    assert.equal((await sent()).length, serialBeforeCommands);
     await press('Alt+2');
     await page.locator('#command-group').selectOption({ label: '板卡' });
     await click('查询板卡');
-    await until(async () => (await sent()).toString() === 'reboot\recho board\r\n', 'command button sends CRLF to serial');
+    await suffix(serialBeforeCommands, 'echo board\r\n');
     await page.locator('#command-group').selectOption({ label: 'Linux' });
     await click('管理按钮');
     for (let index = 1; index <= 16; index++) {
@@ -523,7 +667,7 @@ async function main() {
     await lastCommand.scrollIntoViewIfNeeded();
     assert((await page.locator('#command-button-list').evaluate(list => list.scrollTop)) > 0);
     await lastCommand.click();
-    await until(async () => (await sent()).toString() === 'reboot\recho board\r\necho test 16', 'send a command without an ending');
+    await suffix(serialBeforeCommands, 'echo board\r\necho test 16');
     await click('管理按钮');
     await page.locator('.command-edit-row').last().getByRole('button', { name: '删除按钮' }).click();
     await addGroup('待删除分组');
@@ -533,6 +677,18 @@ async function main() {
     await page.locator('#command-group').selectOption({ label: 'Linux' });
     assert.equal(await page.locator('#command-button-list button').count(), 16);
     console.log('Grouped command buttons, active-tab routing, line endings, wrap, scroll and deletion OK');
+    await focus();
+    await press('Control+c');
+    await feed('\r\n# ');
+    await shellState('已就绪');
+    base = (await sent()).length;
+    await start();
+    await suffix(base, 'reboot\r');
+    await electron.evaluate(() => globalThis.fixture.disconnect());
+    await value('#global-state', '已断开');
+    await timerState('异常停止');
+    assert.equal((await sent()).subarray(base).toString(), 'reboot\r');
+    console.log('Disconnect cancels pending workflow steps');
 
     const port = server.port;
     await server.close();

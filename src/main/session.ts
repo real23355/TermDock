@@ -6,6 +6,7 @@ import { Client, type ClientChannel, type SFTPWrapper } from 'ssh2';
 import { SerialPort } from 'serialport';
 import type { Auth, Forward, ForwardOptions, LocalProfile, OpenRequest, PortInfo, SerialProfile, SessionEvent, Size, SshProfile, TimerOptions } from '../shared';
 import { SessionLogs } from './logs';
+import { SecretEchoFilter } from './secret-echo';
 import { LocalPty } from './local-pty';
 import { SerialTimer } from './timer';
 import { listRemote, transferFile } from './sftp';
@@ -53,6 +54,7 @@ export class Session {
   private key?: { token: string; fingerprint: string; endpoint: string; callback: (valid: boolean) => void };
   private size: Size;
   private logs?: SessionLogs;
+  private echoFilter?: SecretEchoFilter;
   private timer?: SerialTimer;
   private connecting: Promise<void>;
   private ending?: Promise<void>;
@@ -93,7 +95,7 @@ export class Session {
         if (paused) stream?.pause();
         else stream?.resume();
       }
-    });
+    }, serial?.path);
     if (this.state === 'disconnected') { await logs.close(); return; }
     this.logs = logs;
     logs.event('connecting', request.profile.kind);
@@ -120,7 +122,11 @@ export class Session {
     serial.on('error', error => void this.end(errorText(error), true));
     serial.on('close', (error?: Error) => void this.end(error ? errorText(error) : '串口已断开', true));
     this.timer = new SerialTimer(logs, bytes => this.sendSerial(serial, bytes),
-      state => this.emit({ id: this.id, type: 'timer', state }), () => this.state === 'connected');
+      state => this.emit({ id: this.id, type: 'timer', state }), () => this.state === 'connected',
+      password => {
+        if (this.echoFilter) this.deliver(this.echoFilter.finish());
+        this.echoFilter = new SecretEchoFilter(password);
+      });
     serial.on('data', this.receive);
     this.openingSerial = new Promise<void>((resolve, reject) => serial.open(error => error ? reject(error) : resolve()));
     await this.openingSerial;
@@ -205,8 +211,13 @@ export class Session {
 
   private receive = (bytes: Buffer) => {
     if (this.state === 'disconnected') return;
-    this.logs?.receive(bytes);
     this.timer?.receive(bytes);
+    this.deliver(this.echoFilter?.filter(bytes) ?? bytes);
+  };
+
+  private deliver(bytes: Buffer) {
+    if (!bytes.length) return;
+    this.logs?.receive(bytes);
     this.output.push(bytes);
     this.outputBytes += bytes.length;
     while (this.outputBytes > displayLimit && this.output.length) {
@@ -215,7 +226,7 @@ export class Session {
       this.outputSkipped += chunk.length;
     }
     this.queueOutput();
-  };
+  }
 
   private queueOutput() {
     if (this.outputJob || this.inFlight || (!this.outputBytes && !this.outputSkipped)) return;
@@ -331,8 +342,8 @@ export class Session {
   }
 
   record(enabled: boolean) {
-    if (!this.logs || this.state !== 'connected' || this.serial) throw new Error('当前会话不支持切换日志');
-    this.logs.record(enabled);
+    if (!this.logs || this.state !== 'connected') throw new Error('当前会话不支持切换日志');
+    return this.logs.record(enabled);
   }
 
   async serialBreak() {
@@ -366,6 +377,10 @@ export class Session {
     // Stop writes immediately. Update the UI after releasing the device so that
     // a flashing tool can open the COM port as soon as disconnection is shown.
     this.state = 'disconnected';
+    if (this.echoFilter) {
+      this.logs?.receive(this.echoFilter.finish());
+      this.echoFilter = undefined;
+    }
     if (failed) this.timer?.stop(detail, true);
     const pendingWrite = this.timer?.dispose();
     this.logs?.event(failed ? 'connection_error' : 'disconnected', detail);

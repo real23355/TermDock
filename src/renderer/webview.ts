@@ -7,6 +7,7 @@ type HostReply = { kind: 'reply'; id: number; ok: boolean; value?: unknown; erro
 type HostPacket = HostReply | { kind: 'event'; event: WireEvent } | { kind: 'closed'; error: string };
 type WebView = {
   postMessage(packet: object): void;
+  postMessageWithAdditionalObjects(packet: object, files: File[]): void;
   addEventListener(type: 'message', handler: (event: MessageEvent<HostPacket>) => void): void;
 };
 
@@ -47,18 +48,26 @@ export function connectWebView() {
     }
   });
 
-  return desktopBridge(
-    (name, ...args) => new Promise((resolve, reject) => {
+  function request<T>(name: string, args: unknown[], files?: File[]) {
+    return new Promise<T>((resolve, reject) => {
       if (closed) { reject(new Error(closed)); return; }
       const id = ++sequence;
-      pending.set(id, { resolve, reject });
-      try { webview.postMessage({ kind: 'request', id, name, args }); }
+      pending.set(id, { resolve: value => resolve(value as T), reject });
+      const packet = { kind: 'request', id, name, args };
+      try {
+        if (files) webview!.postMessageWithAdditionalObjects(packet, files);
+        else webview!.postMessage(packet);
+      }
       catch (error) { pending.delete(id); reject(error); }
-    }),
+    });
+  }
+  return desktopBridge(
+    (name, ...args) => request(name, args),
     (name, ...args) => { if (!closed) webview.postMessage({ kind: 'notify', name, args }); },
     listener => {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
+    files => request<string[]>('dropped-paths', [], files),
   );
 }

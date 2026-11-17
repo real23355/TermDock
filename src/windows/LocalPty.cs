@@ -2,6 +2,7 @@ using System;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using Microsoft.Win32.SafeHandles;
@@ -22,6 +23,32 @@ internal static class LocalPty
             errors.AutoFlush = true;
             try
             {
+                if (args.Length == 2 && (args[0] == "--protect" || args[0] == "--unprotect"))
+                {
+                    using (var input = Console.OpenStandardInput())
+                    using (var output = Console.OpenStandardOutput())
+                    using (var memory = new MemoryStream())
+                    {
+                        input.CopyTo(memory);
+                        var bytes = memory.ToArray();
+                        var entropy = Encoding.ASCII.GetBytes(args[1]);
+                        byte[] result = null;
+                        try
+                        {
+                            result = args[0] == "--protect"
+                                ? ProtectedData.Protect(bytes, entropy, DataProtectionScope.CurrentUser)
+                                : ProtectedData.Unprotect(bytes, entropy, DataProtectionScope.CurrentUser);
+                            output.Write(result, 0, result.Length);
+                        }
+                        finally
+                        {
+                            Array.Clear(memory.GetBuffer(), 0, memory.Capacity);
+                            Array.Clear(bytes, 0, bytes.Length);
+                            if (result != null) Array.Clear(result, 0, result.Length);
+                        }
+                    }
+                    return 0;
+                }
                 if (args.Length != 5) throw new ArgumentException("LocalPty requires columns, rows, shell, directory and module path policy");
                 short columns = short.Parse(args[0]);
                 short rows = short.Parse(args[1]);

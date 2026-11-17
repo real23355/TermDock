@@ -1,8 +1,8 @@
 {
   "name": "termdock",
   "productName": "TermDock",
-  "version": "0.0.1-1116",
-  "releaseVersion": "V0.0.1_1116",
+  "version": "0.0.2-1117",
+  "releaseVersion": "V0.0.2_1117",
   "private": true,
   "description": "Windows SSH and serial terminal with reboot testing",
   "main": "dist/main.cjs",

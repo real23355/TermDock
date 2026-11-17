@@ -1,15 +1,17 @@
 import type { DesktopApi, SessionEvent } from './shared';
 
-export type Bridge = DesktopApi & { copy(value: string): Promise<void>; paste(): Promise<string> };
+export type Bridge = DesktopApi & { copy(value: string): Promise<void>; paste(): Promise<string>; droppedPaths(files: File[]): Promise<string[]> };
 type Invoke = (name: string, ...args: unknown[]) => Promise<any>;
 type Send = (name: string, ...args: unknown[]) => void;
 
-export function desktopBridge(invoke: Invoke, send: Send, onSession: (callback: (event: SessionEvent) => void) => () => void): Bridge {
+export function desktopBridge(invoke: Invoke, send: Send, onSession: (callback: (event: SessionEvent) => void) => () => void, droppedPaths: Bridge['droppedPaths']): Bridge {
   return {
     load: () => invoke('load'),
     saveProfile: value => invoke('save-profile', value),
     deleteProfile: id => invoke('delete-profile', id),
-    importProfiles: value => invoke('import-profiles', value),
+    editRecent: (old, value) => invoke('edit-recent', old, value),
+    credential: (config, change) => invoke('credential', config, change),
+    droppedPaths,
     savePreferences: value => invoke('preferences', value),
     saveCommandGroups: groups => invoke('save-command-groups', groups),
     runCommand: (id, groupId, buttonId) => invoke('run-command', id, groupId, buttonId),

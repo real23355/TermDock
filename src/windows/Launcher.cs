@@ -5,6 +5,8 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -16,11 +18,26 @@ using Microsoft.Web.WebView2.WinForms;
 
 internal static class Launcher
 {
+    private const string AppId = "TermDock.Desktop";
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
+
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
+        SetCurrentProcessExplicitAppUserModelID(AppId);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+        if (args.Length == 1 && args[0] == "--register-start-menu")
+        {
+            try
+            {
+                StartMenuShortcut.Register(Application.ExecutablePath, AppId);
+                MessageBox.Show("已创建 TermDock 开始菜单快捷方式。", "TermDock");
+            }
+            catch (Exception error) { MessageBox.Show(error.Message, "TermDock", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+            return;
+        }
         string profile = Environment.GetEnvironmentVariable("TERMDOCK_DATA_DIR");
         string dataFolder = string.IsNullOrWhiteSpace(profile)
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "TermDock")
@@ -62,6 +79,7 @@ internal sealed class TerminalWindow : Form
         this.dataFolder = dataFolder;
         this.cacheFolder = cacheFolder;
         Text = "TermDock";
+        Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         Size = new Size(1360, 860);
         MinimumSize = new Size(850, 540);
         StartPosition = FormStartPosition.CenterScreen;
@@ -241,6 +259,12 @@ internal sealed class TerminalWindow : Form
             string name = packet["name"] as string;
             switch (name)
             {
+                case "dropped-paths":
+                    var files = args.AdditionalObjects.Select(item =>
+                        item is CoreWebView2File ? ((CoreWebView2File)item).Path :
+                        item is FileInfo ? ((FileInfo)item).FullName : null).Where(path => path != null).ToArray();
+                    Reply(id, files);
+                    return;
                 case "copy":
                     var values = (System.Collections.IList)packet["args"];
                     var text = values[0] as string;

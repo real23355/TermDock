@@ -63,6 +63,8 @@ async function main() {
   const debugPort = await listen(probe);
   await new Promise(resolve => probe.close(resolve));
   const clientInputs = [];
+  const passwordAttempts = [];
+  let testerPassword = 'fixture-password';
   const pty = [];
   const sizes = [];
   const sshKey = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs1', format: 'pem' });
@@ -72,7 +74,10 @@ async function main() {
     client.on('close', () => clients.delete(client));
     client.on('error', () => {});
     client.on('authentication', context => {
-      if (context.method === 'password' && context.username === 'tester' && context.password === 'fixture-password') context.accept();
+      if (context.method === 'password') passwordAttempts.push(context.username);
+      if (context.method === 'password' && (
+        (context.username === 'tester' && context.password === testerPassword) ||
+        (context.username === 'new-user' && context.password === 'new-target-password'))) context.accept();
       else context.reject(['password']);
     });
     client.on('ready', () => client.on('session', accept => {
@@ -87,13 +92,23 @@ async function main() {
     }));
   });
   const sshPort = await listen(ssh);
-  const launcher = spawn(join(folder, 'TermDock', 'TermDock.exe'), [], {
+  const executable = join(folder, 'TermDock', 'TermDock.exe');
+  const launch = () => spawn(executable, [], {
     stdio: 'ignore',
     env: {
       ...process.env, TERMDOCK_DATA_DIR: profile,
       WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${debugPort} --remote-debugging-address=127.0.0.1`,
     },
   });
+  let launcher = launch();
+  const closeLauncher = async () => {
+    if (launcher.exitCode === null && launcher.pid) {
+      await exec('powershell.exe', [
+        '-NoProfile', '-Command', `(Get-Process -Id ${launcher.pid} -ErrorAction Stop).CloseMainWindow() | Out-Null`,
+      ], { windowsHide: true }).catch(() => {});
+      if (!await until(() => launcher.exitCode !== null, 'graceful shutdown', 12000).catch(() => false)) launcher.kill();
+    }
+  };
   try {
     const endpoint = 'http://127.0.0.1:' + debugPort;
     await until(async () => {
@@ -108,6 +123,24 @@ async function main() {
     page.on('pageerror', error => errors.push(error.message));
     page.setDefaultTimeout(8000);
     const click = name => page.getByRole('button', { name, exact: true }).click();
+    const contextAction = async (target, name) => {
+      await target.click({ button: 'right' });
+      await page.locator('.context-menu').getByRole('button', { name, exact: true }).click();
+    };
+    const saveSession = async () => {
+      await click('保存');
+      await page.locator('#connect-dialog').waitFor({ state: 'hidden' });
+    };
+    const nativeClipboard = (operation, value) => page.evaluate(([operation, value]) => new Promise(resolve => {
+      const id = 2_100_000;
+      const reply = ({ data }) => {
+        if (data.kind !== 'reply' || data.id !== id) return;
+        chrome.webview.removeEventListener('message', reply);
+        resolve(data);
+      };
+      chrome.webview.addEventListener('message', reply);
+      chrome.webview.postMessage({ kind: 'request', id, name: operation, args: [value] });
+    }), [operation, value]);
     const status = text => page.waitForFunction(text => document.querySelector('#global-state').textContent === text, text);
     await page.waitForFunction(() => document.querySelector('#profile-count').textContent === '01');
     assert.equal(await page.title(), 'TermDock');
@@ -131,6 +164,7 @@ async function main() {
     for (const [name, value] of Object.entries({ host: '127.0.0.1', port: sshPort, username: 'tester', password: 'fixture-password' })) {
       await fields.locator(`[name=${name}]`).fill(String(value));
     }
+    await fields.locator('[name=rememberPassword]').check();
     await click('连接');
     await page.locator('#key-dialog').waitFor();
     assert.match(await page.locator('#key-fingerprint').textContent(), /^SHA256:[A-Za-z0-9+/]{43}$/);
@@ -139,6 +173,54 @@ async function main() {
     await page.locator('#recent-connections .profile-open').waitFor();
     const [recent] = (await readConfig('sessions.json')).recentConnections;
     assert.deepEqual(recent.profile, { kind: 'ssh', name: 'SSH', host: '127.0.0.1', port: sshPort, username: 'tester' });
+    const credentialDir = join(profile, 'credentials');
+    const credentialFile = await until(async () => (await readdir(credentialDir).catch(() => [])).find(name => name.endsWith('.dpapi')), 'DPAPI file');
+    assert(!(await readFile(join(credentialDir, credentialFile))).includes('fixture-password'));
+    const recentEntry = page.locator('#recent-connections .profile-open');
+    await contextAction(recentEntry, '设置 / 重命名…');
+    await fields.locator('[name=name]').fill('测试 SSH 重命名');
+    await fields.locator('[name=password]').fill('replacement-fixture-password');
+    await fields.locator('[name=rememberPassword]').check();
+    await saveSession();
+    testerPassword = 'replacement-fixture-password';
+    await recentEntry.filter({ hasText: '测试 SSH 重命名' }).waitFor();
+    assert.equal((await readdir(credentialDir)).filter(name => name.endsWith('.dpapi')).length, 1);
+    const dragSession = async (source, target) => {
+      const from = await source.boundingBox(), to = await target.boundingBox();
+      await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(to.x + to.width / 2, to.y + to.height / 2, { steps: 13 });
+      await page.mouse.move(to.x + to.width / 2 + 2, to.y + to.height / 2);
+      await page.mouse.up();
+    };
+    await dragSession(recentEntry, page.locator('#saved-heading'));
+    await fields.locator('[name=group]').fill('Board lab');
+    await saveSession();
+    const savedSsh = page.locator('#profiles .profile-open').filter({ hasText: '测试 SSH 重命名' });
+    await savedSsh.waitFor();
+    await dragSession(page.getByRole('tab', { name: 'SSH', exact: true }), page.locator('#profiles details').filter({ hasText: 'Board lab' }).locator('summary'));
+    await fields.locator('[name=name]').fill('拖自标签');
+    assert.equal(await fields.locator('[name=group]').inputValue(), 'Board lab');
+    await saveSession();
+    assert.equal((await readConfig('sessions.json')).profiles.length, 3);
+    await contextAction(savedSsh, '另存为新会话…');
+    await fields.locator('[name=name]').fill('新目标');
+    await fields.locator('[name=host]').fill('localhost');
+    await fields.locator('[name=username]').fill('new-user');
+    assert.equal(await fields.locator('[name=password]').inputValue(), '');
+    assert.equal(await fields.locator('#forget-password').isVisible(), false);
+    await saveSession();
+    const newTarget = page.locator('#profiles .profile-open').filter({ hasText: '新目标' });
+    await newTarget.click();
+    await fields.locator('[name=password]').fill('new-target-password');
+    await click('连接');
+    await page.locator('#key-dialog').waitFor();
+    await click('信任并连接');
+    await status('已连接');
+    assert(passwordAttempts.includes('new-user'));
+    await click('关闭 新目标');
+    await page.getByRole('tab', { name: 'SSH', exact: true }).click();
+    for (const name of ['settings.json', 'sessions.json']) assert(!(await readFile(join(profile, name))).includes('fixture-password'));
     assert.equal((await readConfig('settings.json')).hosts['[legacy.invalid]:22'], 'SHA256:legacy');
     await click('旧版查询');
     await until(() => Buffer.from(clientInputs).includes('echo legacy\r'), 'migrated command button sends data');
@@ -163,6 +245,23 @@ async function main() {
     await page.locator('.surface:visible .search-value').fill('PORTABLE_SSH_READY 中文');
     await page.waitForFunction(() => document.querySelector('.surface:not([hidden]) .search-result').textContent === '1 / 1');
     await click('关闭搜索');
+    const copyFixture = 'SESSION_FILTER_TEXT';
+    const sessionSearch = page.locator('#session-search');
+    await nativeClipboard('copy', 'before-selection');
+    await sessionSearch.fill(copyFixture);
+    await sessionSearch.dblclick({ position: { x: 38, y: 15 } });
+    await until(async () => (await nativeClipboard('paste', '')).value === copyFixture, 'ordinary text mouse selection copies');
+    await sessionSearch.click({ position: { x: 40, y: 15 } });
+    assert.equal((await nativeClipboard('paste', '')).value, copyFixture);
+    await sessionSearch.fill('');
+    await contextAction(sessionSearch, '粘贴');
+    await until(async () => (await sessionSearch.inputValue()) === copyFixture, 'ordinary input context-menu paste');
+    await sessionSearch.fill('');
+    await page.locator('#quick-ssh').click();
+    await fields.locator('[name=password]').fill('masked-test-field');
+    await fields.locator('[name=password]').dblclick({ position: { x: 37, y: 15 } });
+    assert.equal((await nativeClipboard('paste', '')).value, copyFixture);
+    await click('取消');
 
     await click('管理按钮');
     await click('新建分组');
@@ -234,7 +333,7 @@ async function main() {
     await click('取消');
     await enterPowerShell("Write-Output ('AFTER_' + 'DIALOG')");
     await findOutput('AFTER_DIALOG');
-    await click('本机 Shell…');
+    await click('自定义启动…');
     await page.locator('#local-form [name=shell]').selectOption('cmd');
     await page.locator('#local-form [name=cwd]').fill(folder);
     await page.locator('#local-form [name=environment]').fill('TERMDOCK_FIXTURE=cmd-env-ok');
@@ -243,28 +342,92 @@ async function main() {
     await status('已连接');
     await page.keyboard.type('echo %TERMDOCK_FIXTURE%');
     await page.keyboard.press('Enter');
-    const cmd = page.locator('.surface:visible');
+    const cmdTab = page.getByRole('tab', { name: 'CMD', exact: true });
+    const cmd = page.locator('#' + await cmdTab.getAttribute('aria-controls'));
     const cmdLog = join(await cmd.locator('.session-logs').getAttribute('title'), 'session.log');
     await until(async () => {
       const log = await readFile(cmdLog, 'utf8');
       return log.includes('cmd-env-ok') && log.includes(folder);
     }, 'CMD cwd and environment');
+    const fixtures = [join(folder, '含 空格的文件.txt'), join(folder, "O'Brien 文件.txt")];
+    for (const [index, path] of fixtures.entries()) await writeFile(path, 'fixture-drop-' + index);
+    const cdp = await page.context().newCDPSession(page);
+    await page.evaluate(() => {
+      globalThis.tdDropTrace = [];
+      for (const name of ['dragenter', 'dragover', 'drop']) {
+        document.addEventListener(name, event => {
+          globalThis.tdDropTrace.push([name, event.target.className, [...event.dataTransfer.types], event.dataTransfer.files.length]);
+        }, true);
+      }
+    });
+    const dragFiles = async surface => {
+      const box = await surface.locator('.xterm-screen').boundingBox();
+      const data = { items: [], files: fixtures, dragOperationsMask: 1 };
+      for (const type of ['dragEnter', 'dragOver', 'drop']) {
+        await cdp.send('Input.dispatchDragEvent', { type, x: box.x + 60, y: box.y + 10, data });
+      }
+    };
+    await page.keyboard.type('echo ');
+    await dragFiles(cmd);
+    try {
+      await until(async () => (await readFile(cmdLog, 'utf8')).includes('含 空格的文件.txt'), 'file drag inserts CMD paths');
+    } catch (error) {
+      console.error('Drop trace', await page.evaluate(() => globalThis.tdDropTrace), await page.locator('#notice span').textContent());
+      throw error;
+    }
+    await page.keyboard.type(' CMD_END');
+    await page.keyboard.press('Enter');
+    await until(async () => (await readFile(cmdLog, 'utf8')).replace(/\x1b\[[0-?]*[ -/]*[@-~]|\r?\n/g, '')
+      .includes(`"${fixtures[0]}" "${fixtures[1]}" CMD_END`), 'quoted multi-file CMD input accepts further typing');
+    await localTab.click();
+    await page.keyboard.type('Write-Output ');
+    await dragFiles(local);
+    await sleep(220);
+    await page.keyboard.type(" ('DROP_' + 'END')");
+    await page.keyboard.press('Enter');
+    await findOutput('DROP_END', true);
+    await findOutput(fixtures[1], true);
+    await cmdTab.click();
     await click('左右分屏');
+    const sshTab = page.getByRole('tab', { name: 'SSH', exact: true });
+    await page.locator('#split-first').selectOption((await sshTab.getAttribute('id')).slice(4));
+    await page.locator('#split-second').selectOption((await localTab.getAttribute('id')).slice(4));
+    await click('应用分屏');
     assert.equal(await page.locator('.surface:visible').count(), 2);
+    const sshSurface = page.locator('#' + await sshTab.getAttribute('aria-controls'));
+    assert((await sshSurface.boundingBox()).x < (await local.boundingBox()).x);
+    await nativeClipboard('copy', 'RIGHT_BUTTON_FIXTURE');
+    const previous = clientInputs.length;
+    await sshSurface.locator('.xterm-screen').click({ button: 'right' });
+    await until(() => Buffer.from(clientInputs.slice(previous)).includes('RIGHT_BUTTON_FIXTURE'), 'right click pastes only into clicked SSH pane');
+    assert(!Buffer.from(clientInputs.slice(previous)).includes(13));
+    await click('交换窗格');
+    assert((await local.boundingBox()).x < (await sshSurface.boundingBox()).x);
+    const divider = await page.locator('.pane-divider').boundingBox();
+    await page.mouse.move(divider.x + 3, divider.y + 40);
+    await page.mouse.down();
+    await page.mouse.move(divider.x + 45, divider.y + 40, { steps: 5 });
+    await page.mouse.up();
+    assert.notEqual(await page.locator('.pane-divider').getAttribute('aria-valuenow'), '50');
+    await sshSurface.locator('.pane-select').selectOption((await cmdTab.getAttribute('id')).slice(4));
+    assert.equal(await sshSurface.isVisible(), false);
+    assert.equal(await cmd.isVisible(), true);
     await local.locator('.xterm-screen').click();
     await enterPowerShell("Write-Output ('SIDE_' + 'PANE')");
     await until(async () => (await readFile(localLog, 'utf8')).includes('SIDE_PANE'), 'input in side-by-side pane');
     await click('上下分屏');
+    await click('应用分屏');
+    assert((await local.boundingBox()).y < (await cmd.boundingBox()).y);
     await enterPowerShell("Write-Output ('STACKED_' + 'PANE')");
     await until(async () => (await readFile(localLog, 'utf8')).includes('STACKED_PANE'), 'input in stacked pane');
-    await click('上下分屏');
+    await click('关闭分屏');
     assert.equal(await page.locator('.surface:visible').count(), 1);
     await page.getByRole('tab', { name: 'CMD', exact: true }).click();
     await localTab.click();
     await enterPowerShell('exit 7');
     await status('已断开');
     assert.match(await page.locator('#global-endpoint').textContent(), /7/);
-    assert.equal((await readConfig('sessions.json')).recentConnections.length, 1);
+    assert.equal((await readConfig('sessions.json')).recentConnections.length, 2);
     console.log('Local PowerShell shortcut, interactive input, Ctrl+C, native PTY resize and exit passed');
 
     assert.deepEqual(errors, []);
@@ -272,14 +435,48 @@ async function main() {
     const [runtimeHash] = await readdir(runtime);
     const runtimeSize = (await stat(join(runtime, runtimeHash, 'node.exe'))).size;
     assert(runtimeSize > size);
+    const icon = await exec('powershell.exe', ['-NoProfile', '-Command',
+      'Add-Type -AssemblyName System.Drawing; $icon = [Drawing.Icon]::ExtractAssociatedIcon($env:TD_FIXTURE_EXE); $bitmap = $icon.ToBitmap(); $bitmap.GetPixel([int]($bitmap.Width * .75), [int]($bitmap.Height * .25)).R; $bitmap.Dispose(); $icon.Dispose()'],
+      { windowsHide: true, env: { ...process.env, TD_FIXTURE_EXE: executable } });
+    assert(Number(icon.stdout.trim()) >= 220);
+    const shortcut = join(folder, 'TermDock.lnk');
+    const shortcutResult = await exec('powershell.exe', ['-NoProfile', '-STA', '-Command', [
+      "$ErrorActionPreference='Stop'",
+      "$asm=[Reflection.Assembly]::LoadFile($env:TD_FIXTURE_EXE)",
+      "$tdDir=Split-Path -LiteralPath $env:TD_FIXTURE_EXE",
+      "$method=$asm.GetType('StartMenuShortcut',$true).GetMethod('Write',[Reflection.BindingFlags]'Static,NonPublic')",
+      "$method.Invoke($null,[string[]]@($env:TD_FIXTURE_SHORTCUT,$env:TD_FIXTURE_EXE,$tdDir,'TermDock.Desktop'))",
+      "$link=(New-Object -ComObject WScript.Shell).CreateShortcut($env:TD_FIXTURE_SHORTCUT)",
+      "$item=(New-Object -ComObject Shell.Application).Namespace((Split-Path -LiteralPath $env:TD_FIXTURE_SHORTCUT)).ParseName('TermDock.lnk')",
+      "[PSCustomObject]@{Target=$link.TargetPath;Icon=$link.IconLocation;AppId=$item.ExtendedProperty('System.AppUserModel.ID')} | ConvertTo-Json -Compress",
+    ].join('\n')], { windowsHide: true, env: { ...process.env, TD_FIXTURE_EXE: executable, TD_FIXTURE_SHORTCUT: shortcut } });
+    const link = JSON.parse(shortcutResult.stdout);
+    assert.equal(link.Target, executable);
+    assert(link.Icon.startsWith(executable));
+    assert.equal(link.AppId, 'TermDock.Desktop');
+    await closeLauncher();
+    launcher = launch();
+    await until(() => fetch(endpoint + '/json/version', { signal: AbortSignal.timeout(400) }).then(r => r.ok, () => false), 'restarted launcher', 20000);
+    const restarted = await chromium.connectOverCDP(endpoint);
+    const reopenedPage = await until(() => restarted.contexts().flatMap(context => context.pages())
+      .find(page => page.url() === 'https://termdock.local/index.html'), 'reopened application page');
+    const reopenedSsh = reopenedPage.locator('#profiles .profile-open').filter({ hasText: '测试 SSH 重命名' });
+    await reopenedSsh.click();
+    const reopenedForm = reopenedPage.locator('#connect-form');
+    await reopenedForm.getByText('此目标已保存密码。', { exact: false }).waitFor();
+    assert.equal(await reopenedForm.locator('[name=password]').inputValue(), '');
+    await reopenedForm.getByRole('button', { name: '连接', exact: true }).click();
+    await reopenedPage.waitForFunction(() => document.querySelector('#global-state').textContent === '已连接');
+    assert.equal(passwordAttempts.at(-1), 'tester');
+    await reopenedSsh.click({ button: 'right' });
+    await reopenedPage.locator('.context-menu').getByRole('button', { name: '设置 / 重命名…', exact: true }).click();
+    await reopenedForm.locator('[name=forgetPassword]').check();
+    await reopenedForm.getByRole('button', { name: '保存', exact: true }).click();
+    await until(async () => !(await readdir(credentialDir)).length, 'clear saved credential');
+    console.log('Recent/Saved session menus and drag, DPAPI replacement and restart, file drop, right-paste, split order and resize, launcher icon OK');
     console.log(`Portable ZIP verified (${size} bytes), first-run runtime extracted (${runtimeSize} bytes), migration, native COM and SSH UI passed`);
   } finally {
-    if (launcher.exitCode === null && launcher.pid) {
-      await exec('powershell.exe', [
-        '-NoProfile', '-Command', `(Get-Process -Id ${launcher.pid} -ErrorAction Stop).CloseMainWindow() | Out-Null`,
-      ], { windowsHide: true }).catch(() => {});
-      if (!await until(() => launcher.exitCode !== null, 'graceful shutdown', 12000).catch(() => false)) launcher.kill();
-    }
+    await closeLauncher();
     for (const client of clients) client.end();
     await new Promise(resolve => ssh.close(resolve));
   }

@@ -51,22 +51,24 @@ export class SessionLogs {
   private failed = false;
   private closing = false;
   private recording = true;
+  private recordQueue = Promise.resolve();
 
   private constructor(
     readonly directory: string,
     private timestamped: boolean,
+    private serialPath: string | undefined,
     private onError: (message: string) => void,
     private onBackpressure: (paused: boolean) => void,
   ) {}
 
   static async create(root: string, name: string, timestamped: boolean,
-    onError: (message: string) => void, onBackpressure: (paused: boolean) => void) {
+    onError: (message: string) => void, onBackpressure: (paused: boolean) => void, serialPath?: string) {
     await mkdir(root, { recursive: true });
     const safeName = name.replace(/[^\p{L}\p{N}_-]+/gu, '_').slice(0, 32);
     const directory = await mkdtemp(join(root, `${stamp(new Date())}_${safeName}_`));
-    const logs = new SessionLogs(directory, timestamped, onError, onBackpressure);
+    const logs = new SessionLogs(directory, timestamped, serialPath, onError, onBackpressure);
     try {
-      logs.session = await logs.openCapture('session.log');
+      logs.session = await logs.openSegment();
       logs.events = await logs.openFile('events.log');
       return logs;
     } catch (error) {
@@ -76,10 +78,43 @@ export class SessionLogs {
   }
 
   get healthy() { return !this.failed && !this.closing; }
+  get roundRecording() { return !!this.round && this.healthy; }
   record(enabled: boolean) {
-    if (!this.healthy) throw new Error('日志不可用');
-    this.recording = enabled;
-    this.event(enabled ? 'recording_started' : 'recording_stopped');
+    const operation = this.recordQueue.then(async () => {
+      if (!this.healthy) throw new Error('日志不可用');
+      if (enabled === this.recording) return;
+      if (this.serialPath) {
+        if (enabled) {
+          try { this.session = await this.openSegment(); }
+          catch (error) { this.fail((error as Error).message); throw error; }
+        } else {
+          this.recording = false;
+          const capture = this.session;
+          this.session = undefined;
+          await this.endCapture(capture);
+          if (!this.healthy) throw new Error('日志刷盘失败');
+        }
+      }
+      this.recording = enabled;
+      this.event(enabled ? 'recording_started' : 'recording_stopped');
+    });
+    this.recordQueue = operation.catch(() => {});
+    return operation;
+  }
+
+  private async openSegment() {
+    if (!this.serialPath) return this.openCapture('session.log');
+    const base = this.serialPath.toUpperCase() + '-' + stamp(new Date());
+    for (let sequence = 1; ; sequence++) {
+      try { return await this.openCapture(base + (sequence === 1 ? '' : '-' + sequence) + '.log'); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+    }
+  }
+
+  private async endCapture(capture: Capture | undefined) {
+    const files = [capture?.readable, capture?.raw].filter(file => file !== undefined);
+    for (const file of files) file.stream.end();
+    await Promise.all(files.map(file => file.done));
   }
 
   private async openCapture(name: string): Promise<Capture> {
@@ -97,7 +132,7 @@ export class SessionLogs {
   private async openFile(name: string, timestamped = false): Promise<LogFile> {
     const path = join(this.directory, name);
     const handle = await open(path, 'wx');
-    const stream = handle.createWriteStream({ highWaterMark: 256 * 1024 });
+    const stream = handle.createWriteStream({ highWaterMark: 256 * 1024, flush: true });
     const file = { path, stream, done: Promise.resolve(), lines: timestamped ? new LogLines() : undefined };
     this.files.add(file);
     file.done = finished(stream, { cleanup: true })
@@ -172,6 +207,7 @@ export class SessionLogs {
 
   async close() {
     this.closing = true;
+    await this.recordQueue;
     const files = Array.from(this.files);
     for (const file of files) file.stream.end();
     await Promise.all(files.map(file => file.done));

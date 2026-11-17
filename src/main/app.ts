@@ -7,6 +7,7 @@ import { createController } from './controller';
 
 export function startApp(options: { serial?: SerialProvider; dataDirectory?: string } = {}) {
   app.setName('TermDock');
+  if (process.platform === 'win32') app.setAppUserModelId('TermDock.Desktop');
   if (options.dataDirectory) app.setPath('userData', options.dataDirectory);
   if (!app.requestSingleInstanceLock()) { app.quit(); return; }
   let window: BrowserWindow | undefined;
@@ -18,10 +19,10 @@ export function startApp(options: { serial?: SerialProvider; dataDirectory?: str
     !!event.senderFrame && event.senderFrame === event.sender.mainFrame && event.senderFrame.url === pageURL;
 
   const handle = (name: string, run: (...args: unknown[]) => unknown) => {
-    ipcMain.handle('td:' + name, (event, ...args: unknown[]) => {
+    ipcMain.handle('td:' + name, async (event, ...args: unknown[]) => {
       if (!permitted(event)) throw new Error('IPC 来源无效');
       try {
-        return run(...args);
+        return await run(...args);
       } catch (error) {
         if (error instanceof z.ZodError) throw new Error(error.issues[0]?.message ?? '参数无效');
         throw error;
@@ -81,6 +82,7 @@ export function startApp(options: { serial?: SerialProvider; dataDirectory?: str
 
     window = new BrowserWindow({
       title: 'TermDock', width: 1360, height: 860, minWidth: 850, minHeight: 540,
+      icon: join(__dirname, 'TermDock.ico'),
       backgroundColor: '#101319', show: false,
       titleBarStyle: 'hidden', titleBarOverlay: { color: '#101319', symbolColor: '#bac5d6', height: 40 },
       webPreferences: { preload: join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },

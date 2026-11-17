@@ -130,17 +130,14 @@ export class Store {
 
   delete(id: string) { this.updateSessions({ profiles: this.profiles.filter(p => p.id !== id) }); }
 
-  importProfiles(entries: Profile[]) {
-    const profiles = [...this.profiles];
-    for (const entry of entries) {
-      if (!profiles.some(saved => saved.id === entry.id ||
-        (saved.name === entry.name && sameEndpoint(saved, entry)))) {
-        profiles.push({ ...entry, id: entry.id ?? randomUUID() });
-      }
-    }
-    const added = profiles.length - this.profiles.length;
-    if (added) this.updateSessions({ profiles });
-    return { profiles, added };
+  editRecent(old: RecentConnection, value: Profile) {
+    const { id: _id, ...config } = value;
+    const index = this.recentConnections.findIndex(entry => entry.connectedAt === old.connectedAt && sameEndpoint(entry.profile, old.profile));
+    if (index < 0) throw new Error('最近连接已更新，请重新打开设置');
+    const recentConnections = this.recentConnections.slice();
+    recentConnections[index] = { profile: config, connectedAt: old.connectedAt };
+    this.updateSessions({ recentConnections });
+    return recentConnections;
   }
 
   recordConnection(value: Profile) {

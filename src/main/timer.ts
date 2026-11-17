@@ -2,6 +2,7 @@ import { performance } from 'node:perf_hooks';
 import { StringDecoder } from 'node:string_decoder';
 import { lineEndings, type ShellState, type TimerOptions, type TimerState } from '../shared';
 import type { SessionLogs } from './logs';
+import { SerialWorkflow } from './serial-workflow';
 
 const settleMs = 400;
 
@@ -32,12 +33,19 @@ class PromptTracker {
     this.bootSeen = false;
   }
 
+  resetShell() {
+    const bootSeen = this.bootSeen;
+    this.beforeSend();
+    this.bootSeen = bootSeen;
+  }
+
   input(data: string) {
     // Ignore terminal-generated device replies and mouse reports.
-    if (/^(?:\x1b\[(?:[?><]?[\d;]+[cRnMmu]|\?\d+;\d+\$y)|\x1b\[M[\s\S]{3})$/.test(data)) return;
+    if (/^(?:\x1b\[(?:[?><]?[\d;]+[cRnMmu]|\?\d+;\d+\$y)|\x1b\[M[\s\S]{3})$/.test(data)) return false;
     const bracketedPaste = data.includes('\x1b[200~');
     this.manual = !bracketedPaste && /[\r\n\x03\x04]$/.test(data) ? 'submitted' : 'typing';
     this.resetLine();
+    return true;
   }
 
   feed(bytes: Buffer, now: number) {
@@ -125,12 +133,15 @@ export class SerialTimer {
   private detail = '';
   private lastState = '';
   private waitReason = '';
+  private workflow?: SerialWorkflow;
+  private abort?: AbortController;
 
   constructor(
     private logs: SessionLogs,
     private write: (bytes: Buffer) => Promise<void>,
     private publish: (state: TimerState) => void,
     private isConnected: () => boolean,
+    private mask: (secret: string) => void,
   ) {
     this.interval = setInterval(() => this.tick(), 100);
     this.tick();
@@ -146,7 +157,7 @@ export class SerialTimer {
     this.recoveryRound = undefined;
     this.bootSeen = false;
     this.active = true;
-    this.due = performance.now() + options.intervalSeconds * 1000;
+    this.due = performance.now() + (options.once ? 0 : options.intervalSeconds * 1000);
     this.waitReason = '';
     this.detail = '';
     this.logs.event('test_started', `interval=${options.intervalSeconds}s max=${options.maxRounds ?? '-'} shell=${options.waitForShell}`);
@@ -157,6 +168,11 @@ export class SerialTimer {
     if (this.active || this.writing) this.logs.event('test_stopped', detail);
     if (!this.active && !this.writing && !error) return;
     this.generation++;
+    this.abort?.abort();
+    if (this.options?.login) {
+      const { login: _login, ...rest } = this.options;
+      this.options = rest;
+    }
     this.active = false;
     this.send = error ? 'error' : 'stopped';
     this.detail = detail;
@@ -164,13 +180,19 @@ export class SerialTimer {
   }
 
   dispose() {
-    this.stop('连接已关闭');
+    if (this.active) this.stop('连接已关闭');
     clearInterval(this.interval);
     return this.pending;
   }
 
-  input(data: string) { this.tracker.input(data); this.tick(); }
-  receive(bytes: Buffer) { this.tracker.feed(bytes, performance.now()); }
+  input(data: string) {
+    if (this.tracker.input(data) && this.workflow && this.active) this.stop('手动输入已停止自动流程');
+    this.tick();
+  }
+  receive(bytes: Buffer) {
+    this.tracker.feed(bytes, performance.now());
+    this.workflow?.receive(bytes);
+  }
 
   private waitFor(shell: ShellState) {
     if (shell === 'login') return '等待登录';
@@ -204,7 +226,7 @@ export class SerialTimer {
       if (!seconds && !wait) this.pending = this.sendRound(this.generation, this.options!);
     }
     const state = { send: this.send, shell, rounds: this.rounds, recovered: this.recovered,
-      bootSeen: this.bootSeen, seconds, detail: this.detail };
+      bootSeen: this.bootSeen, seconds, detail: this.detail, roundRecording: this.logs.roundRecording };
     const key = JSON.stringify(state);
     if (key !== this.lastState) {
       this.lastState = key;
@@ -217,7 +239,8 @@ export class SerialTimer {
     this.send = 'sending';
     const round = this.rounds + 1;
     try {
-      const file = await this.logs.prepareRound(options.command);
+      const label = options.steps ? 'workflow' : options.command;
+      const file = await this.logs.prepareRound(label);
       const now = performance.now();
       if (generation !== this.generation || !this.isConnected() || !this.logs.healthy ||
         this.waitFor(this.tracker.state(now, options.prompt))) {
@@ -229,21 +252,49 @@ export class SerialTimer {
       this.recoveryRound = round;
       this.bootSeen = false;
       this.logs.event('send_attempt', `round=${round}`);
-      await this.write(Buffer.from(options.command + lineEndings[options.lineEnding]));
+      if (options.steps) {
+        const abort = this.abort = new AbortController();
+        let firstWrite = true;
+        const workflow = this.workflow = new SerialWorkflow(
+          abort.signal,
+          bytes => {
+            if (firstWrite) { this.due = performance.now() + options.intervalSeconds * 1000; firstWrite = false; }
+            return this.write(bytes);
+          },
+          detail => { this.detail = detail; this.tick(); },
+          (event, detail) => this.logs.event(event, `round=${round} step=${detail}`),
+          this.mask,
+          () => this.tracker.resetShell(),
+          () => this.tracker.state(performance.now(), options.prompt) === 'ready',
+        );
+        await workflow.run(options);
+      } else {
+        await this.write(Buffer.from(options.command + lineEndings[options.lineEnding]));
+        this.due = performance.now() + options.intervalSeconds * 1000;
+      }
       this.rounds = round;
       this.logs.event('sent', `round=${round}`);
-      this.due = performance.now() + options.intervalSeconds * 1000;
-      if (this.active && options.maxRounds === round) {
+      if (this.active && (options.once || options.maxRounds === round)) {
         this.active = false;
         this.send = 'finished';
+        this.detail = options.steps ? '流程已完成' : this.detail;
+        if (this.options?.login) {
+          const { login: _login, ...rest } = this.options;
+          this.options = rest;
+        }
         this.logs.event('test_finished', `rounds=${round}`);
       }
     } catch (error) {
       if (this.recoveryRound === round) this.recoveryRound = undefined;
-      const detail = error instanceof Error ? error.message : String(error);
-      this.logs.event('send_error', `round=${round} ${detail}`);
-      if (generation === this.generation) this.stop(detail, true);
+      if (generation === this.generation) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const failed = options.steps && this.detail ? `${this.detail} · ${detail}` : detail;
+        this.logs.event('send_error', `round=${round} ${failed}`);
+        this.stop(failed, true);
+      }
     } finally {
+      this.workflow = undefined;
+      this.abort = undefined;
       this.writing = false;
       this.pending = undefined;
       this.tick();

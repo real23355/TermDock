@@ -28,6 +28,8 @@ export const sshProfile = z.object({
   host: z.string().trim().regex(/^[\w.:%-]{1,253}$/, '请输入主机名或 IP 地址'),
   port: z.number().int().min(1).max(65535),
   username: z.string().trim().min(1, '请输入用户名').max(128),
+  method: z.literal(['password', 'key', 'agent']).optional(),
+  privateKey: z.string().max(4096).optional(),
 });
 export const profile = z.discriminatedUnion('kind', [sshProfile, serialProfile]);
 export const localProfile = z.object({
@@ -46,14 +48,30 @@ export const authSchema = z.discriminatedUnion('method', [
 export const sizeSchema = z.object({
   cols: z.number().int().min(2).max(1000), rows: z.number().int().min(1).max(500),
 });
+const singleLine = z.string().min(1).max(1024).refine(s => s.trim() && !/[\x00-\x1f\x7f]/.test(s), '请输入单行命令');
+export const timerStep = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('send'), command: singleLine, lineEnding: z.literal(['CR', 'LF', 'CRLF', 'none']) }),
+  z.object({ type: z.literal('wait'), milliseconds: z.number().int().min(1).max(2_147_483_647) }),
+  z.object({ type: z.literal('login') }),
+]);
 export const timerSchema = z.object({
-  command: z.string().min(1).max(1024).refine(s => s.trim() && !/[\x00-\x1f\x7f]/.test(s), '请输入单行命令'),
+  command: singleLine,
   intervalSeconds: z.number().int().min(1).max(86400),
   maxRounds: z.number().int().min(1).max(1000000).optional(),
   lineEnding: z.literal(['CR', 'LF', 'CRLF']),
   waitForShell: z.boolean(),
   prompt: z.string().trim().max(128).refine(s => !/[\x00-\x1f\x7f]/.test(s)),
-});
+  once: z.boolean().optional(),
+  steps: timerStep.array().min(1).max(40).optional(),
+  login: z.object({
+    username: singleLine,
+    password: z.string().min(1, '请输入自动登录密码').max(1024).refine(s => !/[\x00-\x1f\x7f]/.test(s)),
+    loginPrompt: singleLine.max(128),
+    passwordPrompt: singleLine.max(128),
+    timeoutSeconds: z.number().int().min(1).max(3600),
+  }).optional(),
+}).refine(options => !options.steps || options.steps.some(step => step.type === 'send' || (step.type === 'login' && !!options.login)),
+  '流程至少需要一个发送命令或启用的登录步骤');
 export const preferencesSchema = z.object({
   font: z.literal(['macOS', 'Cascadia Mono', 'Consolas', 'Lucida Console', 'monospace']),
   fontSize: z.number().int().min(9).max(36),
@@ -102,6 +120,7 @@ export type SendState = 'idle' | 'countdown' | 'waiting' | 'sending' | 'stopped'
 export type ShellState = 'unknown' | 'ready' | 'login' | 'bootloader' | 'manual' | 'recovering';
 export type TimerState = {
   send: SendState; shell: ShellState; rounds: number; recovered: number; bootSeen: boolean; seconds: number; detail: string;
+  roundRecording: boolean;
 };
 export type PortInfo = { path: string; manufacturer?: string; friendlyName?: string };
 export type RemoteEntry = { name: string; kind: 'directory' | 'file' | 'link' | 'other'; size: number };
@@ -115,7 +134,7 @@ export type SessionEvent =
   | { id: string; type: 'host-key'; key: HostKey }
   | { id: string; type: 'error'; detail: string }
   | { id: string; type: 'output'; data: Uint8Array; sequence: number; skipped: number };
-export type OpenRequest = { id: string; profile: SessionProfile; auth?: Auth; size: Size };
+export type OpenRequest = { id: string; profile: SessionProfile; auth?: Auth; size: Size; useSavedPassword?: boolean; rememberPassword?: boolean };
 export type DesktopApi = {
   load(): Promise<{
     profiles: SavedProfile[]; recentConnections: RecentConnection[]; preferences: Preferences;
@@ -123,7 +142,8 @@ export type DesktopApi = {
   }>;
   saveProfile(value: Profile): Promise<SavedProfile>;
   deleteProfile(id: string): Promise<void>;
-  importProfiles(value: unknown): Promise<{ profiles: SavedProfile[]; added: number }>;
+  editRecent(old: RecentConnection, value: Profile): Promise<RecentConnection[]>;
+  credential(config: SshProfile, change?: { action: 'save' | 'clear'; password?: string }): Promise<boolean>;
   savePreferences(value: Preferences): Promise<Preferences>;
   saveCommandGroups(groups: CommandGroup[]): Promise<CommandGroup[]>;
   runCommand(id: string, groupId: string, buttonId: string): Promise<void>;

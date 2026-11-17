@@ -8,6 +8,7 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { build } from 'esbuild';
 import { buildLocalPty } from './windows-pty.mjs';
+import { buildWindowsIcon } from './windows-icon.mjs';
 
 if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('请在 Windows x64 和 x64 Node.js 上打包');
 const require = createRequire(import.meta.url);
@@ -68,7 +69,8 @@ try {
   const bin = join(stage, 'bin');
   const ui = join(portable, 'ui');
   const backend = join(portable, 'backend');
-  await Promise.all([sdk, bin, ui, backend].map(path => mkdir(path, { recursive: true })));
+  await mkdir(portable);
+  await Promise.all([sdk, bin, ui, backend].map(path => mkdir(path)));
   run('tar.exe', ['-xf', sdkArchive, '-C', sdk, 'LICENSE.txt', 'NOTICE.txt', 'lib/net462', 'runtimes/win-x64/native/WebView2Loader.dll']);
   run('tar.exe', ['-xf', nodeArchive, '-C', bin, 'package/bin/node.exe']);
   run('tar.exe', ['-xf', zipArchive, '-C', bin, 'package/win/x64/7za.exe']);
@@ -78,9 +80,12 @@ try {
   const core = join(sdk, 'lib', 'net462', 'Microsoft.Web.WebView2.Core.dll');
   const forms = join(sdk, 'lib', 'net462', 'Microsoft.Web.WebView2.WinForms.dll');
   const compiler = join(process.env.SystemRoot ?? 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
+  const icon = join(stage, 'TermDock.ico');
+  await buildWindowsIcon(icon);
   run(compiler, ['/nologo', '/target:winexe', '/platform:x64', '/optimize+', '/utf8output', '/codepage:65001',
     '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', '/r:System.Web.Extensions.dll',
-    '/r:' + core, '/r:' + forms, '/out:' + join(portable, 'TermDock.exe'), resolve('src/windows/Launcher.cs')]);
+    '/win32icon:' + icon, '/r:' + core, '/r:' + forms, '/out:' + join(portable, 'TermDock.exe'),
+    resolve('src/windows/Launcher.cs'), resolve('src/windows/StartMenuShortcut.cs')]);
   buildLocalPty(join(backend, 'termdock-pty.exe'));
 
   const nativeBinding = join(bindings, 'prebuilds', 'win32-ia32', '@serialport+bindings-cpp.node');
@@ -115,6 +120,7 @@ try {
     cp(forms, join(portable, 'Microsoft.Web.WebView2.WinForms.dll')),
     cp(join(sdk, 'runtimes', 'win-x64', 'native', 'WebView2Loader.dll'), join(portable, 'WebView2Loader.dll')),
     cp('README.md', join(portable, 'README.md')),
+    writeFile(join(portable, 'Create-Start-Menu-Shortcut.cmd'), '@echo off\r\nstart "" "%~dp0TermDock.exe" --register-start-menu\r\n'),
     writeFile(join(portable, 'runtime.sha256'), nodeHash + '\n'),
   ]);
   const bundled = new Set(Object.keys({ ...worker.metafile.inputs, ...renderer.metafile.inputs }).flatMap(file => {

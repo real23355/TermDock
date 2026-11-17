@@ -6,17 +6,20 @@ import { createCommandBar } from './command-bar';
 import { connectWebView } from './webview';
 import { highlightKeywords } from './keyword-highlight';
 import { createSftpBrowser } from './sftp-browser';
+import { quoteDroppedPaths } from './shell-paths';
+import { bindWorkflow } from './workflow-editor';
+import type { Bridge } from '../desktop-bridge';
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
 import {
   authSchema, defaults, lineEndings, localDefaults, localProfile, preferencesSchema, profile as profileSchema, serialDefaults, timerSchema,
-  type Auth, type ConnectionState, type DesktopApi, type HostKey, type Preferences, type Profile, type RecentConnection,
+  type Auth, type ConnectionState, type HostKey, type OpenRequest, type Preferences, type Profile, type RecentConnection,
   type SavedProfile, type SessionEvent, type SessionProfile, type SshProfile, type TimerState,
 } from '../shared';
 
 declare global {
   interface Window {
-    termDock: DesktopApi & { copy(value: string): Promise<void>; paste(): Promise<string> };
+    termDock: Bridge;
   }
 }
 
@@ -45,7 +48,7 @@ const connectionLabels = { connecting: '连接中', connected: '已连接', disc
 type Tab = {
   id: string; profile: SessionProfile; term: Terminal; fit: FitAddon; search: SearchAddon; gl?: WebglAddon;
   gpuFailed?: boolean; surface: HTMLElement; tab: HTMLButtonElement; wrapper: HTMLElement; state: ConnectionState; closing?: boolean;
-  detail: string; timer?: TimerState; warning?: string; logDir?: string;
+  detail: string; timer?: TimerState; warning?: string; logDir?: string; reconnectProfile?: Profile;
 };
 
 const tabs = new Map<string, Tab>();
@@ -54,13 +57,15 @@ let pendingKey: HostKey | undefined;
 let active: Tab | undefined;
 let previouslyFocused: Tab | undefined;
 let split: [Tab, Tab] | undefined;
-let draggedTab: Tab | undefined;
 let profiles: SavedProfile[] = [];
 let preferences: Preferences = defaults;
 let editing: SavedProfile | undefined;
+let editingRecent: RecentConnection | undefined;
 let reconnecting: Tab | undefined;
 let forwardTab: Tab | undefined;
-let connectMode: 'quick' | 'save' | 'edit' | 'auth' = 'quick';
+let connectMode: 'quick' | 'save' | 'edit' | 'auth' | 'recent' | 'tab' = 'quick';
+let editingTab: Tab | undefined;
+let credentialQuery = 0;
 
 function message(error: unknown) {
   if (error && typeof error === 'object' && 'issues' in error) {
@@ -88,14 +93,171 @@ function assign(form: HTMLFormElement, values: object) {
   }
 }
 function cleanAuth() {
-  assign(connectForm, { method: 'password', password: '', passphrase: '', privateKey: '' });
+  credentialQuery++;
+  assign(connectForm, { method: 'password', password: '', passphrase: '', privateKey: '', rememberPassword: false, forgetPassword: false });
 }
 
 function endpoint(config: SessionProfile) {
   if (config.kind === 'local') return '本机 ' + config.name;
   return config.kind === 'ssh' ? `${config.username}@${config.host}:${config.port}` : `${config.path}  /  ${config.baudRate}`;
 }
-function profileButton(config: Profile) {
+
+const contextMenu = document.createElement('div');
+contextMenu.className = 'context-menu';
+contextMenu.hidden = true;
+document.body.append(contextMenu);
+function popup(event: MouseEvent, items: [string, () => void][]) {
+  event.preventDefault();
+  event.stopPropagation();
+  const target = event.target as HTMLElement;
+  (target.closest('dialog') ?? document.body).append(contextMenu);
+  contextMenu.replaceChildren(...items.map(([label, action]) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    button.onclick = () => { contextMenu.hidden = true; action(); };
+    return button;
+  }));
+  contextMenu.hidden = false;
+  contextMenu.style.left = Math.max(0, Math.min(event.clientX, innerWidth - contextMenu.offsetWidth - 4)) + 'px';
+  contextMenu.style.top = Math.max(0, Math.min(event.clientY, innerHeight - contextMenu.offsetHeight - 4)) + 'px';
+}
+document.addEventListener('pointerdown', event => {
+  if (!(event.target instanceof Node) || !contextMenu.contains(event.target)) contextMenu.hidden = true;
+});
+document.addEventListener('keydown', event => { if (event.key === 'Escape') contextMenu.hidden = true; });
+
+type TextControl = HTMLInputElement | HTMLTextAreaElement;
+function textControl(target: EventTarget | null): TextControl | undefined {
+  if (target instanceof HTMLTextAreaElement && !target.closest('.xterm')) return target;
+  if (target instanceof HTMLInputElement && ['text', 'search', 'tel', 'url', 'password'].includes(target.type)) return target;
+}
+document.addEventListener('contextmenu', event => {
+  const input = textControl(event.target);
+  if (!input) return;
+  const selection = () => input.value.slice(input.selectionStart ?? 0, input.selectionEnd ?? 0);
+  const items: [string, () => void][] = [];
+  if (input.type !== 'password' && selection()) items.push(['复制', () => safe(api.copy(selection()))]);
+  if (!input.readOnly && !input.disabled) items.push(['粘贴', () => safe(api.paste().then(value => {
+    if (!value || !input.isConnected) return;
+    input.setRangeText(value, input.selectionStart ?? input.value.length, input.selectionEnd ?? input.value.length, 'end');
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste' }));
+    input.focus();
+  }))]);
+  items.push(['全选', () => { input.focus(); input.select(); }]);
+  popup(event, items);
+});
+let textSelectionStart: { target: EventTarget | null; x: number; y: number } | undefined;
+document.addEventListener('mousedown', event => {
+  if (event.button !== 0) return;
+  textSelectionStart = { target: event.target, x: event.clientX, y: event.clientY };
+}, true);
+document.addEventListener('mouseup', event => {
+  if (event.button !== 0) return;
+  const start = textSelectionStart;
+  textSelectionStart = undefined;
+  if (!start || !(start.target instanceof HTMLElement) || start.target.closest('.terminal-mount,.context-menu,.session-drag-source')) return;
+  if (start.x === event.clientX && start.y === event.clientY && event.detail < 2) return;
+  const input = textControl(start.target);
+  if (input?.type === 'password') return;
+  queueMicrotask(() => {
+    const selection = document.getSelection();
+    const value = input ? input.value.slice(input.selectionStart ?? 0, input.selectionEnd ?? 0) :
+      (selection?.anchorNode?.parentElement?.closest('.xterm,input[type=password]') ? '' : selection?.toString());
+    if (value) safe(api.copy(value));
+  });
+}, true);
+
+function connectProfile(config: Profile) {
+  if (config.kind === 'ssh') openConnect('ssh', 'auth', config);
+  else safe(openTab(config));
+}
+function saveAs(config: Profile, group = config.group) {
+  openConnect(config.kind, 'save', { ...config, id: undefined, group });
+}
+function bindProfileMenu(element: HTMLElement, config: Profile, recent?: RecentConnection, tab?: Tab) {
+  element.oncontextmenu = event => {
+    const items: [string, () => void][] = [
+      [tab ? '切换到会话' : '连接', () => tab ? focusTab(tab) : connectProfile(config)],
+      [config.id ? '另存为新会话…' : '保存为会话…', () => saveAs(config)],
+      ['设置 / 重命名…', () => {
+        const settings = tab?.reconnectProfile ?? profiles.find(saved => saved.id === config.id) ?? config;
+        openConnect(settings.kind, settings.id ? 'edit' : recent ? 'recent' : tab ? 'tab' : 'save', settings);
+        editingRecent = recent;
+        editingTab = tab;
+        field('name').select();
+      }],
+    ];
+    if (config.id) items.push(['删除会话…', () => {
+      if (confirm(`删除已保存的会话「${config.name}」？`)) safe(deleteProfile(config.id!));
+    }]);
+    popup(event, items);
+  };
+}
+function bindProfileDrag(element: HTMLElement, config: Profile) {
+  beginSessionDrag(element, { config });
+}
+const profileDropZones = new WeakMap<HTMLElement, string | undefined>();
+function bindProfileDrop(element: HTMLElement, group?: string) {
+  profileDropZones.set(element, group);
+  element.dataset.sessionDrop = '';
+}
+bindProfileDrop(find('[aria-labelledby=saved-heading]'));
+
+// Internal drags stay in the page; only file drops use the host's native drag data.
+let sessionDrag: { x: number; y: number; pointer: number; config?: Profile; tab?: Tab; dragging?: boolean; target?: HTMLElement } | undefined;
+function beginSessionDrag(element: HTMLElement, source: { config?: Profile; tab?: Tab }) {
+  element.classList.add('session-drag-source');
+  element.onpointerdown = event => {
+    if (event.button === 0) sessionDrag = { ...source, x: event.clientX, y: event.clientY, pointer: event.pointerId };
+  };
+}
+function dragTarget(event: PointerEvent) {
+  const node = document.elementFromPoint(event.clientX, event.clientY);
+  const area = sessionDrag?.config && node?.closest<HTMLElement>('[data-session-drop]');
+  if (area) return area;
+  const tab = sessionDrag?.tab && node?.closest<HTMLElement>('.tab-wrapper');
+  if (tab && tab !== sessionDrag?.tab?.wrapper) return tab;
+}
+function clearSessionDrag() {
+  sessionDrag?.target?.classList.remove('drop-target');
+  document.body.classList.remove('session-dragging');
+  sessionDrag = undefined;
+}
+document.addEventListener('pointermove', event => {
+  const drag = sessionDrag;
+  if (!drag || drag.pointer !== event.pointerId) return;
+  if (!(event.buttons & 1)) { clearSessionDrag(); return; }
+  if (!drag.dragging && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 7) return;
+  drag.dragging = true;
+  document.body.classList.add('session-dragging');
+  const target = dragTarget(event);
+  if (drag.target === target) return;
+  drag.target?.classList.remove('drop-target');
+  drag.target = target;
+  target?.classList.add('drop-target');
+});
+document.addEventListener('pointerup', event => {
+  const drag = sessionDrag;
+  if (!drag || drag.pointer !== event.pointerId) return;
+  const target = drag.dragging ? dragTarget(event) : undefined;
+  clearSessionDrag();
+  if (!target) return;
+  if (drag.config && profileDropZones.has(target)) {
+    saveAs(drag.config, profileDropZones.get(target) ?? drag.config.group);
+  } else if (drag.tab && tabs.has(drag.tab.id) && target.dataset.sessionId) {
+    const position = document.createComment('');
+    drag.tab.wrapper.replaceWith(position);
+    target.replaceWith(drag.tab.wrapper);
+    position.replaceWith(target);
+    updateTabShortcuts();
+    restoreTerminalFocus();
+  }
+});
+document.addEventListener('pointercancel', clearSessionDrag);
+window.addEventListener('blur', clearSessionDrag);
+
+function profileButton(config: Profile, recent?: RecentConnection) {
   const open = document.createElement('button');
   open.type = 'button';
   open.className = 'profile-open';
@@ -111,10 +273,9 @@ function profileButton(config: Profile) {
   hint.textContent = endpoint(config);
   text.append(name, hint);
   open.append(badge, text);
-  open.onclick = () => {
-    if (config.kind === 'ssh') openConnect('ssh', 'auth', config);
-    else safe(openTab(config));
-  };
+  open.onclick = () => connectProfile(config);
+  bindProfileMenu(open, config, recent);
+  if (recent) bindProfileDrag(open, config);
   return open;
 }
 
@@ -145,6 +306,7 @@ function renderProfiles() {
         section.open = true;
         section.append(heading);
         list.append(section);
+        bindProfileDrop(section, group);
         target = section;
       } else {
         target = document.createElement('div');
@@ -160,6 +322,7 @@ function renderProfiles() {
     edit.title = edit.ariaLabel = `编辑 ${saved.name}`;
     edit.onclick = () => openConnect(saved.kind, 'edit', saved);
     row.append(profileButton(saved), edit);
+    bindProfileMenu(row, saved);
     target.append(row);
   }
   if (profiles.length && !groups.size) emptyProfiles(list, '没有匹配的会话');
@@ -174,7 +337,7 @@ function renderRecentConnections(connections: RecentConnection[]) {
   for (const { profile, connectedAt } of connections) {
     const row = document.createElement('div');
     row.className = 'profile';
-    const open = profileButton(profile);
+    const open = profileButton(profile, { profile, connectedAt });
     open.title = `${endpoint(profile)} · 最近连接 ${connectionDate.format(new Date(connectedAt))}`;
     row.append(open);
     list.append(row);
@@ -205,12 +368,10 @@ function setLogDirectory(path: string) {
 
 function updateForm() {
   const serial = field('kind').value === 'serial';
-  const authNeeded = connectMode === 'quick' || connectMode === 'auth';
   const serialFields = find<HTMLFieldSetElement>('#serial-fields');
   const sshFields = find<HTMLFieldSetElement>('#ssh-fields');
   serialFields.hidden = serialFields.disabled = !serial;
   sshFields.hidden = sshFields.disabled = serial;
-  find('#auth-fields').hidden = !authNeeded;
   field('path').required = field('baudRate').required = serial;
   field('host').required = field('port').required = field('username').required = !serial;
   const key = field('method').value === 'key';
@@ -218,23 +379,45 @@ function updateForm() {
   find('#password-fields').hidden = field('method').value !== 'password';
 }
 
+async function updateCredential() {
+  const tick = ++credentialQuery;
+  field('password').placeholder = '';
+  find('#forget-password').hidden = true;
+  find('#credential-status').textContent = '';
+  if (field('kind').value !== 'ssh' || field('method').value !== 'password') return;
+  const config = profileSchema.safeParse({ kind: 'ssh', name: 'SSH', host: field('host').value,
+    port: Number(field('port').value), username: field('username').value });
+  if (!config.success || config.data.kind !== 'ssh') return;
+  const saved = await api.credential(config.data);
+  if (tick !== credentialQuery || !connectDialog.open) return;
+  find('#forget-password').hidden = !saved;
+  field('password').placeholder = saved ? '留空使用已保存的密码' : '';
+  find('#credential-status').textContent = saved ? '此目标已保存密码。勾选记住密码并输入新密码可替换。' : '';
+}
+
 function openConnect(kind: Profile['kind'], mode: typeof connectMode = 'quick', config?: Profile, previous?: Tab) {
   connectMode = mode;
+  editingRecent = undefined;
+  editingTab = undefined;
   editing = config?.id ? config as SavedProfile : undefined;
   reconnecting = previous;
   connectForm.reset();
   assign(connectForm, { ...serialDefaults, ...sshDefaults, ...(config ?? (kind === 'ssh' ? sshDefaults : serialDefaults)), kind });
   setLogDirectory(config?.kind === 'serial' ? config.logDirectory ?? '' : '');
   cleanAuth();
+  if (config?.kind === 'ssh') assign(connectForm, { method: config.method ?? 'password', privateKey: config.privateKey ?? '' });
   field('kind').disabled = mode === 'auth';
-  for (const name of ['name', 'host', 'port', 'username']) field(name).readOnly = mode === 'auth';
-  find('#connect-title').textContent = ({ quick: '快速连接', save: '新建会话', edit: '编辑会话', auth: '连接 SSH' })[mode];
+  for (const name of ['name', 'group', 'keywords', 'host', 'port', 'username']) field(name).readOnly = mode === 'auth';
+  field('favorite').disabled = mode === 'auth';
+  find('#connect-title').textContent = ({ quick: '快速连接', save: config ? '另存为新会话' : '新建会话',
+    edit: '编辑已保存会话', auth: '连接 SSH', recent: '编辑最近连接', tab: '编辑重连设置' })[mode];
   find<HTMLButtonElement>('#save-profile').hidden = mode === 'auth';
-  find<HTMLButtonElement>('#connect-now').hidden = mode === 'save' || mode === 'edit';
+  find<HTMLButtonElement>('#connect-now').hidden = ['save', 'edit', 'recent', 'tab'].includes(mode);
   find<HTMLButtonElement>('#delete-profile').hidden = mode !== 'edit';
   find('#connect-error').hidden = true;
   updateForm();
   connectDialog.showModal();
+  safe(updateCredential());
   if (kind === 'serial') safe(refreshPorts());
   if (mode === 'auth') field('password').focus();
 }
@@ -250,7 +433,9 @@ function parseProfile(): Profile {
     parity: text('parity'), stopBits: number('stopBits'), flow: text('flow'),
     logDirectory: text('logDirectory') || undefined, logFormat: text('logFormat'),
     inputEnding: text('inputEnding'), localEcho: field('localEcho').checked,
-  } : { ...base, host: text('host'), port: number('port'), username: text('username') });
+  } : { ...base, host: text('host'), port: number('port'), username: text('username'),
+    method: text('method') !== 'password' ? text('method') : undefined,
+    privateKey: text('method') === 'key' ? text('privateKey') || undefined : undefined });
 }
 
 async function submitConnect(event: SubmitEvent) {
@@ -261,23 +446,40 @@ async function submitConnect(event: SubmitEvent) {
   errorBox.hidden = true;
   try {
     const config = parseProfile();
-    if (button?.value === 'save' || connectMode === 'save' || connectMode === 'edit') {
+    const save = button?.value === 'save' || ['save', 'edit', 'recent', 'tab'].includes(connectMode);
+    const password = field('password').value;
+    const isPassword = config.kind === 'ssh' && field('method').value === 'password';
+    const remember = isPassword && field('rememberPassword').checked && !!password;
+    const forget = isPassword && !find('#forget-password').hidden && field('forgetPassword').checked;
+    if (remember && forget) throw new Error('请选择替换密码或清除密码');
+    if (config.kind === 'ssh' && forget) await api.credential(config, { action: 'clear' });
+    if (config.kind === 'ssh' && remember && save) await api.credential(config, { action: 'save', password });
+    if (connectMode === 'recent' && editingRecent) {
+      renderRecentConnections(await api.editRecent(editingRecent, config));
+      connectDialog.close();
+    } else if (connectMode === 'tab' && editingTab) {
+      editingTab.reconnectProfile = config;
+      connectDialog.close();
+      showNotice('设置将在此会话下次重连时生效');
+    } else if (save) {
       const saved = await api.saveProfile(config);
       const index = profiles.findIndex(p => p.id === saved.id);
       if (index < 0) profiles.push(saved);
       else profiles[index] = saved;
+      if (editingTab) editingTab.reconnectProfile = saved;
       renderProfiles();
       connectDialog.close();
     } else {
-      const auth = config.kind === 'ssh' ? authSchema.parse({
-        method: field('method').value, password: field('password').value,
+      const useSavedPassword = config.kind === 'ssh' && isPassword && !password && !forget && await api.credential(config);
+      const auth = config.kind === 'ssh' && !useSavedPassword ? authSchema.parse({
+        method: field('method').value, password,
         privateKey: field('privateKey').value, passphrase: field('passphrase').value,
       }) : undefined;
       const previous = reconnecting;
       connectDialog.close();
       cleanAuth();
       if (previous) await closeTab(previous);
-      await openTab(config, auth);
+      await openTab(config, auth, { useSavedPassword, rememberPassword: remember });
     }
   } catch (error) {
     if (connectDialog.open) {
@@ -287,27 +489,33 @@ async function submitConnect(event: SubmitEvent) {
   } finally { if (button) button.disabled = false; }
 }
 connectForm.onsubmit = event => { void submitConnect(event); };
-connectDialog.addEventListener('close', () => { cleanAuth(); nextKey(); });
+connectDialog.addEventListener('close', () => { cleanAuth(); nextKey(); restoreTerminalFocus(); });
 field('kind').onchange = () => {
   field('name').value = field('kind').value === 'ssh' ? sshDefaults.name : serialDefaults.name;
   updateForm();
+  safe(updateCredential());
   if (field('kind').value === 'serial') safe(refreshPorts());
 };
-field('method').onchange = updateForm;
+field('method').onchange = () => { updateForm(); safe(updateCredential()); };
+for (const name of ['host', 'port', 'username']) field(name).oninput = () => {
+  assign(connectForm, { password: '', passphrase: '', rememberPassword: false, forgetPassword: false });
+  safe(updateCredential());
+};
 find('#refresh-ports').onclick = () => safe(refreshPorts());
 find('#pick-log-directory').onclick = () => safe(api.pickLogDirectory().then(path => {
   if (path) setLogDirectory(path);
 }));
 find('#reset-log-directory').onclick = () => setLogDirectory('');
 find('#pick-key').onclick = () => safe(api.pickKey().then(path => { if (path) field('privateKey').value = path; }));
+async function deleteProfile(id: string) {
+  await api.deleteProfile(id);
+  profiles = profiles.filter(p => p.id !== id);
+  renderProfiles();
+}
 find('#delete-profile').onclick = () => {
   const id = editing?.id;
   if (!id) return;
-  safe(api.deleteProfile(id).then(() => {
-    profiles = profiles.filter(p => p.id !== id);
-    renderProfiles();
-    connectDialog.close();
-  }));
+  safe(deleteProfile(id).then(() => connectDialog.close()));
 };
 for (const button of document.querySelectorAll<HTMLButtonElement>('[data-dismiss]')) {
   button.onclick = () => button.closest('dialog')?.close();
@@ -386,7 +594,7 @@ function renderPanes() {
       observer.unobserve(mount);
       disableGpu(tab);
     } else {
-      tab.surface.style.order = String(index);
+      tab.surface.style.order = String(index * 2);
       observer.observe(mount);
     }
   }
@@ -395,8 +603,25 @@ function renderPanes() {
   find('#tabs-empty').hidden = !!active;
   for (const [id, direction] of [['#split-side', 'side'], ['#split-stack', 'stack']]) {
     const button = find<HTMLButtonElement>(id);
-    button.disabled = tabs.size < 2;
+    button.disabled = false;
     button.setAttribute('aria-pressed', String(surfaces.dataset.split === direction));
+  }
+  find('#split-swap').hidden = find('#split-close').hidden = !split;
+  divider.hidden = !split;
+  divider.setAttribute('aria-orientation', surfaces.dataset.split === 'stack' ? 'horizontal' : 'vertical');
+  for (const [index, pane] of shown.entries()) {
+    const select = find<HTMLSelectElement>('.pane-select', pane.surface);
+    select.hidden = !split;
+    if (split) {
+      setPaneOptions(select, pane, split[1 - index]);
+      select.ariaLabel = (surfaces.dataset.split === 'stack' ? ['上方', '下方'] : ['左侧', '右侧'])[index] + '连接';
+      select.onchange = () => {
+        const next = tabs.get(select.value);
+        if (!next || !split || split.includes(next)) return;
+        split[index] = next;
+        focusTab(next);
+      };
+    }
   }
   updateFooter();
 }
@@ -410,20 +635,73 @@ function focusTab(tab: Tab) {
   restoreTerminalFocus();
 }
 
-function toggleSplit(direction: string) {
-  if (!active) return;
-  if (surfaces.dataset.split === direction) {
-    split = undefined;
-    delete surfaces.dataset.split;
-  } else {
-    const other = previouslyFocused && previouslyFocused !== active && tabs.has(previouslyFocused.id)
-      ? previouslyFocused : orderedTabs().find(tab => tab !== active);
-    if (!other) return;
-    split ??= [active, other];
-    surfaces.dataset.split = direction;
-  }
-  focusTab(active);
+const splitDialog = find<HTMLDialogElement>('#split-dialog');
+const firstPane = find<HTMLSelectElement>('#split-first');
+const secondPane = find<HTMLSelectElement>('#split-second');
+const divider = document.createElement('div');
+divider.className = 'pane-divider';
+divider.tabIndex = 0;
+divider.setAttribute('role', 'separator');
+divider.ariaLabel = '调整窗格大小';
+surfaces.append(divider);
+let splitRatio = 50;
+function setSplitRatio(ratio: number) {
+  splitRatio = Math.max(20, Math.min(80, ratio));
+  surfaces.style.setProperty('--split-ratio', splitRatio + '%');
+  divider.setAttribute('aria-valuenow', String(Math.round(splitRatio)));
 }
+divider.setAttribute('aria-valuemin', '20');
+divider.setAttribute('aria-valuemax', '80');
+setSplitRatio(50);
+divider.onpointerdown = event => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  divider.setPointerCapture(event.pointerId);
+};
+divider.onpointermove = event => {
+  if (!divider.hasPointerCapture(event.pointerId)) return;
+  const rect = surfaces.getBoundingClientRect();
+  setSplitRatio(surfaces.dataset.split === 'stack'
+    ? (event.clientY - rect.top) * 100 / rect.height : (event.clientX - rect.left) * 100 / rect.width);
+};
+divider.onpointerup = restoreTerminalFocus;
+divider.onkeydown = event => {
+  if (['ArrowLeft', 'ArrowUp', 'ArrowRight', 'ArrowDown'].includes(event.key)) {
+    event.preventDefault();
+    setSplitRatio(splitRatio + (['ArrowLeft', 'ArrowUp'].includes(event.key) ? -5 : 5));
+  }
+};
+let splitDirection = 'side';
+function setPaneOptions(select: HTMLSelectElement, selected?: Tab, excluded?: Tab) {
+  select.replaceChildren(...orderedTabs().filter(tab => tab !== excluded).map((tab, index) => {
+    const option = document.createElement('option');
+    option.value = tab.id;
+    option.textContent = `${index + 1}. ${tab.profile.name} · ${endpoint(tab.profile)}`;
+    return option;
+  }));
+  if (selected) select.value = selected.id;
+}
+function chooseSplit(direction: string) {
+  if (tabs.size < 2 || !active) { showNotice('请先打开第二个终端会话'); return; }
+  splitDirection = direction;
+  const other = previouslyFocused && previouslyFocused !== active ? previouslyFocused : orderedTabs().find(tab => tab !== active);
+  setPaneOptions(firstPane, split?.[0] ?? active);
+  setPaneOptions(secondPane, split?.[1] ?? other);
+  find('#split-first-label').textContent = direction === 'stack' ? '上方连接' : '左侧连接';
+  find('#split-second-label').textContent = direction === 'stack' ? '下方连接' : '右侧连接';
+  find('#split-error').hidden = true;
+  splitDialog.showModal();
+}
+find<HTMLFormElement>('#split-form').onsubmit = event => {
+  event.preventDefault();
+  const first = tabs.get(firstPane.value);
+  const second = tabs.get(secondPane.value);
+  if (!first || !second || first === second) { find('#split-error').hidden = false; return; }
+  split = [first, second];
+  surfaces.dataset.split = splitDirection;
+  splitDialog.close();
+  focusTab(active && split.includes(active) ? active : first);
+};
 
 function orderedTabs() {
   return Array.from(tabList.children, wrapper => tabs.get((wrapper as HTMLElement).dataset.sessionId!)!);
@@ -449,41 +727,7 @@ window.addEventListener('keydown', event => {
 }, { capture: true });
 
 function bindTabDrag(tab: Tab) {
-  tab.tab.draggable = true;
-  tab.tab.ondragstart = event => {
-    if (!event.dataTransfer) return;
-    draggedTab = tab;
-    event.dataTransfer.effectAllowed = 'move';
-    event.dataTransfer.setData('application/x-termdock-tab', tab.id);
-  };
-  tab.tab.ondragend = () => {
-    draggedTab = undefined;
-    tabList.querySelector('.drop-target')?.classList.remove('drop-target');
-  };
-  tab.wrapper.ondragover = event => {
-    if (!draggedTab || draggedTab === tab) return;
-    event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
-    tab.wrapper.classList.add('drop-target');
-  };
-  tab.wrapper.ondragleave = event => {
-    if (!(event.relatedTarget instanceof Node) || !tab.wrapper.contains(event.relatedTarget)) {
-      tab.wrapper.classList.remove('drop-target');
-    }
-  };
-  tab.wrapper.ondrop = event => {
-    const source = draggedTab;
-    if (!source || source === tab || !tabs.has(source.id)) return;
-    event.preventDefault();
-    draggedTab = undefined;
-    const position = document.createComment('');
-    source.wrapper.replaceWith(position);
-    tab.wrapper.replaceWith(source.wrapper);
-    position.replaceWith(tab.wrapper);
-    tab.wrapper.classList.remove('drop-target');
-    updateTabShortcuts();
-    if (active) active.term.focus();
-  };
+  beginSessionDrag(tab.tab, { tab, config: tab.profile.kind === 'local' ? undefined : tab.profile });
 }
 
 function updateFooter() {
@@ -500,6 +744,7 @@ function setTimer(tab: Tab) {
   const inProgress = state && ['countdown', 'waiting', 'sending'].includes(state.send);
   find('.countdown', tab.surface).textContent = inProgress ? `${state.seconds}s` : '—';
   find('.rounds', tab.surface).textContent = String(state?.rounds ?? 0);
+  find('.round-recording', tab.surface).textContent = state?.roundRecording && tab.state === 'connected' ? '记录中' : '未记录';
   find('.recovered-rounds', tab.surface).textContent = String(state?.recovered ?? 0);
   find('.boot-marker', tab.surface).textContent = state?.bootSeen ? '已看到' : '—';
   find('.send-state', tab.surface).textContent = sendLabels[state?.send ?? 'idle'];
@@ -516,6 +761,49 @@ function setTimer(tab: Tab) {
 
 function bindSurface(tab: Tab) {
   const get = <T extends HTMLElement = HTMLElement>(selector: string) => find<T>(selector, tab.surface);
+  const mount = get('.terminal-mount');
+  let selecting = false;
+  mount.addEventListener('mousedown', event => {
+    if (event.button === 0) selecting = true;
+    if (event.button === 2) { event.stopImmediatePropagation(); event.preventDefault(); }
+  }, true);
+  const endSelection = (event: MouseEvent) => {
+    if (event.button === 0 && selecting) {
+      setTimeout(() => {
+        selecting = false;
+        if (tab.term.hasSelection()) safe(api.copy(tab.term.getSelection()));
+      }, 0);
+    }
+  };
+  document.addEventListener('mouseup', endSelection, true);
+  tab.surface.addEventListener('termdock-dispose', () => document.removeEventListener('mouseup', endSelection, true), { once: true });
+  mount.addEventListener('contextmenu', event => {
+    event.stopImmediatePropagation();
+    event.preventDefault();
+    if (tab.state !== 'connected') return;
+    focusTab(tab);
+    safe(api.paste().then(value => {
+      if (value && tab.state === 'connected' && tabs.has(tab.id)) tab.term.paste(value);
+    }));
+  }, true);
+  mount.ondragover = event => {
+    if (!event.dataTransfer?.types.includes('Files')) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = tab.profile.kind === 'local' ? 'copy' : 'none';
+  };
+  mount.ondrop = event => {
+    const files = Array.from(event.dataTransfer?.files ?? []);
+    if (!files.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (tab.profile.kind !== 'local' || tab.state !== 'connected') return;
+    const shell = tab.profile.shell;
+    focusTab(tab);
+    safe(api.droppedPaths(window.termDock ? [] : files).then(paths => {
+      const value = quoteDroppedPaths(shell, paths);
+      if (tab.state === 'connected' && tabs.has(tab.id)) tab.term.paste(value);
+    }));
+  };
   const searchbar = get('.searchbar');
   const query = get<HTMLInputElement>('.search-value');
   const result = get('.search-result');
@@ -593,12 +881,13 @@ function bindSurface(tab: Tab) {
     const enabled = recording.getAttribute('aria-pressed') === 'false';
     safe(api.record(tab.id, enabled).then(() => {
       recording.setAttribute('aria-pressed', String(enabled));
-      recording.textContent = enabled ? '停止录制' : '开始录制';
+      recording.textContent = enabled ? '停止记录' : '开始记录';
       restoreTerminalFocus();
     }).finally(() => { recording.disabled = false; }));
   };
   get('.reconnect').onclick = () => {
-    const config = tab.profile;
+    const config = tab.reconnectProfile ?? (tab.profile.kind !== 'local' && tab.profile.id
+      ? profiles.find(saved => saved.id === (tab.profile as SavedProfile).id) : undefined) ?? tab.profile;
     if (config.kind === 'local') {
       if (!tab.closing) safe(closeTab(tab).then(() => openTab(config)));
       return;
@@ -609,29 +898,37 @@ function bindSurface(tab: Tab) {
   const timerToggle = get('.timer-toggle');
   timerPanel.hidden = timerToggle.hidden = tab.profile.kind !== 'serial';
   timerToggle.setAttribute('aria-expanded', String(!timerPanel.hidden));
-  timerToggle.onclick = () => {
-    timerPanel.hidden = !timerPanel.hidden;
+  const timerExpand = get('.timer-expand');
+  function collapseTimer(collapsed: boolean) {
+    timerPanel.hidden = collapsed;
+    timerExpand.hidden = !collapsed;
     timerToggle.setAttribute('aria-expanded', String(!timerPanel.hidden));
     fitTab(tab);
-  };
+    tab.term.focus();
+  }
+  timerToggle.onclick = () => collapseTimer(!timerPanel.hidden);
+  timerExpand.onclick = () => collapseTimer(false);
+  get('.timer-collapse').onclick = () => collapseTimer(true);
   const timerForm = get<HTMLFormElement>('.timer-form');
+  const workflow = bindWorkflow(timerForm);
   timerForm.onsubmit = event => {
     event.preventDefault();
     try {
       const input = (name: string) => control(timerForm, name);
       const max = input('maxRounds').value;
       const options = timerSchema.parse({
-        command: input('command').value, intervalSeconds: Number(input('intervalSeconds').value),
+        command: input('command').value || 'reboot', intervalSeconds: Number(input('intervalSeconds').value),
         maxRounds: max ? Number(max) : undefined, lineEnding: input('lineEnding').value,
         waitForShell: input('waitForShell').checked, prompt: input('prompt').value,
+        once: input('once').checked, ...workflow.options(),
       });
-      safe(api.startTimer(tab.id, options).then(() => tab.term.focus()));
+      safe(api.startTimer(tab.id, options).then(() => { workflow.clearSecret(); tab.term.focus(); }));
     } catch (error) { showNotice(message(error)); }
   };
   get('.timer-stop').onclick = () => safe(api.stopTimer(tab.id));
 }
 
-async function openTab(profile: SessionProfile, auth?: Auth) {
+async function openTab(profile: SessionProfile, auth?: Auth, passwordOptions?: Pick<OpenRequest, 'useSavedPassword' | 'rememberPassword'>) {
   await loadTerminalFont(preferences.font);
   const id = crypto.randomUUID();
   const term = new Terminal({
@@ -675,6 +972,7 @@ async function openTab(profile: SessionProfile, auth?: Auth) {
   const tab: Tab = { id, profile, term, fit, search, surface, tab: button, wrapper, state: 'connecting', detail: endpoint(profile) };
   tabs.set(id, tab);
   bindTabDrag(tab);
+  if (profile.kind !== 'local') bindProfileMenu(wrapper, profile, undefined, tab);
   updateTabShortcuts();
   button.onclick = () => focusTab(tab);
   close.onclick = () => safe(closeTab(tab));
@@ -687,7 +985,7 @@ async function openTab(profile: SessionProfile, auth?: Auth) {
   bindSurface(tab);
   focusTab(tab);
   try {
-    await api.open({ id, profile, auth, size: { cols: term.cols, rows: term.rows } });
+    await api.open({ id, profile, auth, ...passwordOptions, size: { cols: term.cols, rows: term.rows } });
   } catch (error) {
     removeTab(tab);
     throw error;
@@ -695,6 +993,7 @@ async function openTab(profile: SessionProfile, auth?: Auth) {
 }
 
 function removeTab(tab: Tab) {
+  tab.surface.dispatchEvent(new Event('termdock-dispose'));
   if (previouslyFocused === tab) previouslyFocused = undefined;
   const remainingPane = split?.find(pane => pane !== tab);
   if (split?.includes(tab)) {
@@ -765,7 +1064,7 @@ function handleSession(event: SessionEvent) {
     if (event.logDir) logs.title = event.logDir;
     find('.reconnect', tab.surface).hidden = event.state !== 'disconnected';
     find('.disconnect', tab.surface).hidden = event.state !== 'connected';
-    find('.record-log', tab.surface).hidden = event.state !== 'connected' || tab.profile.kind === 'serial';
+    find('.record-log', tab.surface).hidden = event.state !== 'connected';
     find('.serial-break', tab.surface).hidden = event.state !== 'connected' || tab.profile.kind !== 'serial';
     find('.open-sftp', tab.surface).hidden = event.state !== 'connected' || tab.profile.kind !== 'ssh';
     find('.open-forward', tab.surface).hidden = event.state !== 'connected' || tab.profile.kind !== 'ssh';
@@ -812,9 +1111,18 @@ sidebarToggle.onclick = () => {
 };
 find('#quick-serial').onclick = find('#empty-serial').onclick = () => openConnect('serial');
 find('#quick-ssh').onclick = find('#empty-ssh').onclick = () => openConnect('ssh');
-find('#quick-local').onclick = find('#empty-local').onclick = () => safe(openTab(localDefaults));
-find('#split-side').onclick = () => toggleSplit('side');
-find('#split-stack').onclick = () => toggleSplit('stack');
+for (const button of document.querySelectorAll<HTMLButtonElement>('button[data-shell]')) {
+  button.onclick = () => safe(openTab(localProfile.parse({ kind: 'local', shell: button.dataset.shell,
+    name: button.dataset.shell === 'powershell' ? localDefaults.name : button.textContent })));
+}
+find('#split-side').onclick = () => chooseSplit('side');
+find('#split-stack').onclick = () => chooseSplit('stack');
+find('#split-swap').onclick = () => { if (split && active) { split.reverse(); focusTab(active); } };
+find('#split-close').onclick = () => {
+  split = undefined;
+  delete surfaces.dataset.split;
+  if (active) focusTab(active);
+};
 async function refreshForwards(tab: Tab) {
   const entries = await api.listForwards(tab.id);
   if (tab !== forwardTab || !forwardDialog.open) return;
@@ -845,20 +1153,6 @@ find<HTMLFormElement>('#forward-form').onsubmit = event => {
     .then(() => refreshForwards(tab))
     .catch(error => { if (tab === forwardTab) status.textContent = message(error); })
     .finally(() => { submit.disabled = false; });
-};
-const importFile = find<HTMLInputElement>('#import-profile-file');
-find('#import-profiles').onclick = () => importFile.click();
-importFile.onchange = () => {
-  const file = importFile.files?.[0];
-  importFile.value = '';
-  if (!file) return;
-  safe((async () => {
-    if (file.size > 1024 * 1024) throw new Error('会话文件超过 1 MiB');
-    const result = await api.importProfiles(JSON.parse((await file.text()).replace(/^\uFEFF/, '')));
-    profiles = result.profiles;
-    renderProfiles();
-    showNotice('已导入 ' + result.added + ' 个会话');
-  })());
 };
 const localDialog = find<HTMLDialogElement>('#local-dialog');
 find('#local-options').onclick = () => localDialog.showModal();

@@ -1,10 +1,12 @@
 import { build } from 'esbuild';
 import { copyFile, mkdir } from 'node:fs/promises';
 import { buildLocalPty } from './windows-pty.mjs';
+import { buildWindowsIcon } from './windows-icon.mjs';
 
 await mkdir('dist', { recursive: true });
 buildLocalPty('dist/termdock-pty.exe');
 await Promise.all([
+  buildWindowsIcon('dist/TermDock.ico'),
   build({
     entryPoints: { main: 'src/main/index.ts', preload: 'src/preload.ts' },
     outdir: 'dist', outExtension: { '.js': '.cjs' }, bundle: true,
