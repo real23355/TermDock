@@ -1,4 +1,5 @@
 import { commandGroupsSchema, type CommandButton, type CommandGroup, type DesktopApi } from '../shared';
+import { icon } from './icons';
 
 export function createCommandBar(
   api: Pick<DesktopApi, 'saveCommandGroups'>,
@@ -18,11 +19,65 @@ export function createCommandBar(
   const deleteGroup = find<HTMLButtonElement>('#delete-command-group');
   const errorBox = find('#command-form-error');
   const saveButton = find<HTMLButtonElement>('#save-command-groups');
+  const overflow = find<HTMLButtonElement>('#command-overflow');
+  const overflowMenu = find('#command-overflow-menu');
 
   let groups: CommandGroup[] = [];
   let selectedId = '';
   let draft: CommandGroup[] = [];
   let editingId = '';
+  let items: HTMLButtonElement[] = [];
+  let connected = false;
+  let frame = 0;
+
+  function closeOverflow() { overflowMenu.hidden = true; overflow.setAttribute('aria-expanded', 'false'); }
+  function layout() {
+    closeOverflow();
+    overflow.hidden = true;
+    for (const button of items) button.removeAttribute('role');
+    buttonList.replaceChildren(...items);
+    overflowMenu.replaceChildren();
+    if (!items.length) return;
+    const widths = items.map(item => item.getBoundingClientRect().width);
+    const gap = 4;
+    const total = widths.reduce((sum, width) => sum + width, 0) + Math.max(0, items.length - 1) * gap;
+    if (total <= buttons.clientWidth) return;
+    overflow.hidden = false;
+    const available = buttons.clientWidth;
+    let used = 0;
+    let count = 0;
+    for (const width of widths) {
+      const next = used + (count ? gap : 0) + width;
+      if (next > available) break;
+      used = next; count++;
+    }
+    buttonList.replaceChildren(...items.slice(0, count));
+    overflowMenu.replaceChildren(...items.slice(count));
+    for (const button of items.slice(count)) button.role = 'menuitem';
+    for (const button of items) button.disabled = !connected;
+  }
+  function queueLayout() { cancelAnimationFrame(frame); frame = requestAnimationFrame(layout); }
+  new ResizeObserver(queueLayout).observe(find('.command-bar'));
+  // The footer spans the window; also remeasure if the workspace changes independently.
+  new ResizeObserver(queueLayout).observe(find('.workspace'));
+  window.addEventListener('resize', queueLayout);
+  overflow.onclick = () => {
+    if (overflowMenu.hidden) {
+      overflowMenu.hidden = false; overflow.setAttribute('aria-expanded', 'true');
+      overflowMenu.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
+    } else { closeOverflow(); onDialogClose(); }
+  };
+  document.addEventListener('pointerdown', event => {
+    if (event.target instanceof Node && !overflow.contains(event.target) && !overflowMenu.contains(event.target)) closeOverflow();
+  });
+  overflowMenu.onkeydown = event => {
+    if (event.key === 'Escape') { event.preventDefault(); closeOverflow(); onDialogClose(); }
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const buttons = [...overflowMenu.querySelectorAll<HTMLButtonElement>('button:not(:disabled)')];
+    const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    buttons[event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : buttons.length - 1)) % buttons.length]?.focus();
+  };
 
   function fillSelect(select: HTMLSelectElement, values: CommandGroup[], selected: string) {
     const group = values.find(group => group.id === selected) ?? values[0];
@@ -30,22 +85,27 @@ export function createCommandBar(
     select.replaceChildren(...(options.length ? options : [new Option('命令分组', '')]));
     select.disabled = !group;
     select.value = group?.id ?? '';
+    select.title = group?.name ?? '命令分组';
     return group;
   }
 
   function renderBar() {
     const group = fillSelect(groupSelect, groups, selectedId);
     selectedId = group?.id ?? '';
-    const items = group ? group.buttons.map(item => {
+    items = group ? group.buttons.map(item => {
       const button = document.createElement('button');
       button.type = 'button';
-      button.textContent = item.name;
+      button.className = 'command-button';
+      button.dataset.buttonId = item.id;
+      const label = document.createElement('span');
+      label.textContent = item.name;
+      button.append(icon('command'), label);
       button.title = `${item.name}\n${item.command}`;
-      button.onclick = () => send(group.id, item.id);
+      button.onclick = () => { closeOverflow(); send(group.id, item.id); };
+      button.disabled = !connected;
       return button;
     }) : [];
-    buttonList.replaceChildren(...items);
-    buttonList.scrollTop = 0;
+    layout();
   }
 
   function renderEditor() {
@@ -151,6 +211,10 @@ export function createCommandBar(
       groups = value;
       renderBar();
     },
-    setConnected(connected: boolean) { buttons.disabled = !connected; },
+    setConnected(value: boolean) {
+      connected = value;
+      buttons.disabled = !value;
+      for (const button of items) button.disabled = !value;
+    },
   };
 }

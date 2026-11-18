@@ -2,6 +2,7 @@ import { createInterface } from 'node:readline';
 import { z } from 'zod';
 import { createController } from './controller';
 import { errorText, type SerialProvider } from './session';
+import type { AiTransport } from './ai';
 
 const message = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('request'), id: z.number().int().positive(), name: z.string(), args: z.array(z.unknown()) }),
@@ -9,12 +10,12 @@ const message = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('quit') }),
 ]);
 
-export function startWorker(directory: string, serial?: SerialProvider) {
+export function startWorker(directory: string, serial?: SerialProvider, aiTransport?: AiTransport) {
   const send = (packet: object) => process.stdout.write(JSON.stringify(packet) + '\n');
   const controller = createController(directory, event => {
     const payload = event.type === 'output' ? { ...event, data: Buffer.from(event.data).toString('base64') } : event;
     send({ kind: 'event', event: payload });
-  }, serial);
+  }, serial, aiTransport);
   const reader = createInterface({ input: process.stdin, crlfDelay: Infinity });
   let closing = false;
   async function close() {

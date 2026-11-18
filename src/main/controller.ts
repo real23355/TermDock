@@ -8,6 +8,7 @@ import {
 import { errorText, Session, systemSerial, type SerialProvider } from './session';
 import { Store } from './store';
 import { Credentials } from './credentials';
+import { createAi, type AiTransport } from './ai';
 
 const uuid = z.string().uuid();
 const openSchema = z.object({ id: uuid, profile: sessionProfile, auth: authSchema.optional(), size: sizeSchema,
@@ -27,7 +28,7 @@ const forwardOptions = z.object({
 });
 type Handler = (...args: unknown[]) => unknown;
 
-export function createController(directory: string, emit: (event: SessionEvent) => void, serial: SerialProvider = systemSerial) {
+export function createController(directory: string, emit: (event: SessionEvent) => void, serial: SerialProvider = systemSerial, aiTransport?: AiTransport) {
   const store = new Store(directory);
   const credentials = new Credentials(directory);
   const logRoot = join(directory, 'logs');
@@ -39,6 +40,7 @@ export function createController(directory: string, emit: (event: SessionEvent) 
     if (!session) throw new Error('会话已关闭');
     return session;
   }
+  const ai = createAi(store, credentials, aiTransport, { acquire: (id, runId, cancel) => requireSession(id).acquireAiSerial(runId, cancel), emit });
 
   const requests: Record<string, Handler> = {
     load: () => ({
@@ -55,8 +57,14 @@ export function createController(directory: string, emit: (event: SessionEvent) 
         if (change.action === 'save') await credentials.save(config, change.password);
         else await credentials.clear(config);
       }
-      return credentials.has(config);
+      return credentials.status(config);
     },
+    'ai-settings': ai.settings,
+    'ai-save': ai.save,
+    'ai-test': ai.test,
+    'ai-chat': ai.chat,
+    'ai-assist': ai.assist,
+    'ai-cancel': ai.cancel,
     preferences: value => store.setPreferences(preferencesSchema.parse(value)),
     'save-command-groups': value => store.setCommandGroups(commandGroupsSchema.parse(value)),
     'run-command': (id, groupId, buttonId) => {
@@ -74,20 +82,16 @@ export function createController(directory: string, emit: (event: SessionEvent) 
       if (config.kind === 'ssh' && request.useSavedPassword) {
         request.auth = { method: 'password', password: await credentials.get(config) };
       }
-      let remember = request.rememberPassword && request.auth?.method === 'password' ? request.auth.password : undefined;
       if (sessions.has(request.id) || quitting) throw new Error('无法打开新会话');
+      if (config.kind === 'ssh' && request.rememberPassword && request.auth?.method === 'password') {
+        if (!request.auth.password) throw new Error('请填写需要保存的 SSH 密码');
+        await credentials.save(config, request.auth.password);
+      }
+      if (quitting) throw new Error('应用正在关闭');
       sessions.set(request.id, new Session(request, store, logRoot, event => {
         emit(event);
         if (event.type !== 'connection' || config.kind === 'local') return;
-        if (event.state === 'disconnected') remember = undefined;
         if (event.state !== 'connected') return;
-        if (config.kind === 'ssh' && remember) {
-          const password = remember;
-          remember = undefined;
-          void credentials.save(config, password).catch(() => {
-            emit({ id: event.id, type: 'error', detail: '登录成功，但 Windows 无法保存 SSH 密码' });
-          });
-        }
         try {
           const recentConnections = store.recordConnection(config);
           emit({ id: event.id, type: 'history', recentConnections });
@@ -140,7 +144,9 @@ export function createController(directory: string, emit: (event: SessionEvent) 
     notifications,
     async closeAll() {
       quitting = true;
+      ai.close();
       await Promise.allSettled([...sessions.values()].map(session => session.end()));
+      await credentials.settled();
     },
   };
 }

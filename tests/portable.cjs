@@ -122,7 +122,12 @@ async function main() {
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
     page.setDefaultTimeout(8000);
-    const click = name => page.getByRole('button', { name, exact: true }).click();
+    const click = async name => {
+      const button = page.getByRole('button', { name, exact: true });
+      if (!['重连', '交换窗格', '关闭分屏', 'Serial Break', '定时发送 / 重启测试'].includes(name)) return button.click();
+      await page.locator('#top-more').click();
+      return page.getByRole('menuitem', { name, exact: true }).click();
+    };
     const contextAction = async (target, name) => {
       await target.click({ button: 'right' });
       await page.locator('.context-menu').getByRole('button', { name, exact: true }).click();
@@ -165,6 +170,9 @@ async function main() {
       await fields.locator(`[name=${name}]`).fill(String(value));
     }
     await fields.locator('[name=rememberPassword]').check();
+    await fields.locator('[name=host]').fill('127.0.0.1 ');
+    assert.equal(await fields.locator('[name=password]').inputValue(), 'fixture-password');
+    assert.equal(await fields.locator('[name=rememberPassword]').isChecked(), true);
     await click('连接');
     await page.locator('#key-dialog').waitFor();
     assert.match(await page.locator('#key-fingerprint').textContent(), /^SHA256:[A-Za-z0-9+/]{43}$/);
@@ -186,12 +194,16 @@ async function main() {
     await recentEntry.filter({ hasText: '测试 SSH 重命名' }).waitFor();
     assert.equal((await readdir(credentialDir)).filter(name => name.endsWith('.dpapi')).length, 1);
     const dragSession = async (source, target) => {
+      await page.bringToFront();
+      await source.scrollIntoViewIfNeeded();
       const from = await source.boundingBox(), to = await target.boundingBox();
       await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
       await page.mouse.down();
       await page.mouse.move(to.x + to.width / 2, to.y + to.height / 2, { steps: 13 });
       await page.mouse.move(to.x + to.width / 2 + 2, to.y + to.height / 2);
+      await page.locator('.drop-target').waitFor({ state: 'visible' });
       await page.mouse.up();
+      await page.locator('#connect-dialog').waitFor({ state: 'visible' });
     };
     await dragSession(recentEntry, page.locator('#saved-heading'));
     await fields.locator('[name=group]').fill('Board lab');
@@ -224,7 +236,7 @@ async function main() {
     assert.equal((await readConfig('settings.json')).hosts['[legacy.invalid]:22'], 'SHA256:legacy');
     await click('旧版查询');
     await until(() => Buffer.from(clientInputs).includes('echo legacy\r'), 'migrated command button sends data');
-    await click('终端设置');
+    await page.locator('#settings').click();
     await page.locator('#settings-form [name=font]').selectOption('macOS');
     await click('应用');
     await page.waitForFunction(() => {
@@ -278,9 +290,9 @@ async function main() {
     await status('已连接');
     const localTab = page.getByRole('tab', { name: 'PowerShell', exact: true });
     const local = page.locator('#' + await localTab.getAttribute('aria-controls'));
-    assert.equal(await local.locator('.endpoint').textContent(), '本机 PowerShell');
+    assert.equal(await page.locator('#active-endpoint').textContent(), '本机 PowerShell');
     assert.equal(await local.locator('.timer-toggle').isVisible(), false);
-    const localLog = join(await local.locator('.session-logs').getAttribute('title'), 'session.log');
+    const localLog = join(await page.locator('.top-tools .session-logs').getAttribute('title'), 'session.log');
     const shellText = async () => (await readFile(localLog, 'utf8')).replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
     const enterPowerShell = async command => {
       await local.locator('.xterm-helper-textarea:focus').waitFor({ state: 'attached' });
@@ -329,7 +341,7 @@ async function main() {
     const localColumns = Number(originalSize.split(' × ')[0]);
     await enterPowerShell("Write-Output ('TERMDOCK_SIZE_' + [Console]::WindowWidth)");
     await findOutput('TERMDOCK_SIZE_' + localColumns);
-    await click('终端设置');
+    await page.locator('#settings').click();
     await click('取消');
     await enterPowerShell("Write-Output ('AFTER_' + 'DIALOG')");
     await findOutput('AFTER_DIALOG');
@@ -344,7 +356,7 @@ async function main() {
     await page.keyboard.press('Enter');
     const cmdTab = page.getByRole('tab', { name: 'CMD', exact: true });
     const cmd = page.locator('#' + await cmdTab.getAttribute('aria-controls'));
-    const cmdLog = join(await cmd.locator('.session-logs').getAttribute('title'), 'session.log');
+    const cmdLog = join(await page.locator('.top-tools .session-logs').getAttribute('title'), 'session.log');
     await until(async () => {
       const log = await readFile(cmdLog, 'utf8');
       return log.includes('cmd-env-ok') && log.includes(folder);
@@ -463,7 +475,7 @@ async function main() {
     const reopenedSsh = reopenedPage.locator('#profiles .profile-open').filter({ hasText: '测试 SSH 重命名' });
     await reopenedSsh.click();
     const reopenedForm = reopenedPage.locator('#connect-form');
-    await reopenedForm.getByText('此目标已保存密码。', { exact: false }).waitFor();
+    await reopenedForm.getByText('密码已保存', { exact: false }).waitFor();
     assert.equal(await reopenedForm.locator('[name=password]').inputValue(), '');
     await reopenedForm.getByRole('button', { name: '连接', exact: true }).click();
     await reopenedPage.waitForFunction(() => document.querySelector('#global-state').textContent === '已连接');

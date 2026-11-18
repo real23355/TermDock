@@ -1,8 +1,8 @@
 {
   "name": "termdock",
   "productName": "TermDock",
-  "version": "0.0.2-1117",
-  "releaseVersion": "V0.0.2_1117",
+  "version": "0.0.3-1118",
+  "releaseVersion": "V0.0.3_1118",
   "private": true,
   "description": "Windows SSH and serial terminal with reboot testing",
   "main": "dist/main.cjs",
@@ -13,7 +13,13 @@
     "start": "npm run build && electron .",
     "test": "npm run build && node tests/app.cjs",
     "package:win": "npm run typecheck && node scripts/package-win.mjs",
-    "test:portable": "node tests/portable.cjs"
+    "package:source": "node scripts/package-source.mjs",
+    "test:portable": "node tests/portable.cjs",
+    "test:ai": "npm run build && node tests/ai.cjs",
+    "test:ai-chat": "npm run build && node tests/ai-chat.cjs && node tests/ai-serial.cjs",
+    "test:compact": "npm run build && node tests/compact.cjs",
+    "test:portable-ai": "node tests/portable-ai.cjs",
+    "test:portable-chat": "node tests/portable-chat.cjs"
   },
   "dependencies": {
     "serialport": "13.0.0",

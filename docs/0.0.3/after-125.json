@@ -1,0 +1,61 @@
+{
+  "viewport": {
+    "width": 1076,
+    "height": 658,
+    "deviceScaleFactor": 1.25
+  },
+  "terminalFontSize": 15,
+  "uiFontSize": "12px",
+  "top": {
+    "x": 236,
+    "y": 0,
+    "width": 840,
+    "height": 32,
+    "top": 0,
+    "right": 1076,
+    "bottom": 32,
+    "left": 236
+  },
+  "commandBar": {
+    "x": 0,
+    "y": 609.6000366210938,
+    "width": 1076,
+    "height": 28,
+    "top": 609.6000366210938,
+    "right": 1076,
+    "bottom": 637.6000366210938,
+    "left": 0
+  },
+  "status": {
+    "x": 0,
+    "y": 637.6000366210938,
+    "width": 1076,
+    "height": 20,
+    "top": 637.6000366210938,
+    "right": 1076,
+    "bottom": 657.6000366210938,
+    "left": 0
+  },
+  "terminal": {
+    "x": 239,
+    "y": 35,
+    "width": 834,
+    "height": 571.6000366210938,
+    "top": 35,
+    "right": 1073,
+    "bottom": 606.6000366210938,
+    "left": 239
+  },
+  "screen": {
+    "x": 239,
+    "y": 35,
+    "width": 818,
+    "height": 562,
+    "top": 35,
+    "right": 1057,
+    "bottom": 597,
+    "left": 239
+  },
+  "rows": "93 × 26",
+  "toolbarTotalHeight": 86.39996337890625
+}

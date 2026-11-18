@@ -127,7 +127,12 @@ async function main() {
     const page = await until(() => browser.contexts().flatMap(context => context.pages())
       .find(page => page.url() === 'https://termdock.local/index.html'), 'TermDock page');
     page.setDefaultTimeout(9000);
-    const click = name => page.getByRole('button', { name, exact: true }).click();
+    const click = async name => {
+      const button = page.getByRole('button', { name, exact: true });
+      if (!['重连', '交换窗格', '关闭分屏', 'Serial Break', '定时发送 / 重启测试'].includes(name)) return button.click();
+      await page.locator('#top-more').click();
+      return page.getByRole('menuitem', { name, exact: true }).click();
+    };
     await page.locator('#quick-ssh').click();
     for (const [name, value] of Object.entries({ host: '127.0.0.1', port: sshPort, username: 'tester', password: 'fixture-password' })) {
       await page.locator(`#connect-form [name=${name}]`).fill(String(value));
@@ -162,6 +167,7 @@ async function main() {
     await page.locator('.surface:visible .search-value').fill('TERMDOCK_TMUX_REAL');
     await page.waitForFunction(() => document.querySelector('.surface:not([hidden]) .search-result').textContent === '1 / 1');
     await click('关闭搜索');
+    console.log('tmux before resize', before, 'UI', await page.locator('#global-size').textContent());
     await click('收起会话栏');
     const after = await until(() => {
       const value = clientSize();
@@ -181,6 +187,7 @@ async function main() {
     assert.deepEqual(paneList().map(paneId).filter(Boolean), panes);
     console.log(JSON.stringify({ version, fixture: 'MSYS2 tmux via ConPTY over loopback SSH', panes, before, after, markerRendered: true, detachAttach: true }));
   } catch (error) {
+    console.error('PTY resize events:', JSON.stringify({ initialSize, resize }));
     console.error('SSH input:', JSON.stringify(Buffer.concat(input).toString()));
     console.error('ConPTY tail:', JSON.stringify(output.slice(-2000)));
     throw error;

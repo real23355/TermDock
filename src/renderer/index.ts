@@ -8,6 +8,8 @@ import { highlightKeywords } from './keyword-highlight';
 import { createSftpBrowser } from './sftp-browser';
 import { quoteDroppedPaths } from './shell-paths';
 import { bindWorkflow } from './workflow-editor';
+import { icon, type IconName } from './icons';
+import { createAiPanel, type ReadablePane } from './ai-panel';
 import type { Bridge } from '../desktop-bridge';
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
@@ -32,6 +34,11 @@ const connectForm = find<HTMLFormElement>('#connect-form');
 const settingsDialog = find<HTMLDialogElement>('#settings-dialog');
 const keyDialog = find<HTMLDialogElement>('#key-dialog');
 const tabList = find('#tabs');
+tabList.addEventListener('wheel', event => {
+  if (tabList.scrollWidth > tabList.clientWidth && Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
+    event.preventDefault(); tabList.scrollLeft += event.deltaY;
+  }
+}, { passive: false });
 const surfaces = find('#surfaces');
 const notice = find('#notice');
 const openSftp = createSftpBrowser(api, find<HTMLDialogElement>('#sftp-dialog'));
@@ -49,7 +56,9 @@ type Tab = {
   id: string; profile: SessionProfile; term: Terminal; fit: FitAddon; search: SearchAddon; gl?: WebglAddon;
   gpuFailed?: boolean; surface: HTMLElement; tab: HTMLButtonElement; wrapper: HTMLElement; state: ConnectionState; closing?: boolean;
   detail: string; timer?: TimerState; warning?: string; logDir?: string; reconnectProfile?: Profile;
+  actions: Partial<Record<TopAction, () => void>>; recording: boolean; recordPending?: boolean;
 };
+type TopAction = 'search' | 'logs' | 'record' | 'disconnect' | 'sftp' | 'forward' | 'reconnect' | 'timer' | 'break';
 
 const tabs = new Map<string, Tab>();
 const keys: HostKey[] = [];
@@ -66,6 +75,9 @@ let forwardTab: Tab | undefined;
 let connectMode: 'quick' | 'save' | 'edit' | 'auth' | 'recent' | 'tab' = 'quick';
 let editingTab: Tab | undefined;
 let credentialQuery = 0;
+let authEndpoint = '';
+let authTargetChanged = false;
+function formEndpoint() { return JSON.stringify([field('host').value.trim().toLowerCase(), Number(field('port').value), field('username').value.trim()]); }
 
 function message(error: unknown) {
   if (error && typeof error === 'object' && 'issues' in error) {
@@ -89,7 +101,7 @@ function assign(form: HTMLFormElement, values: object) {
     const input = control(form, name);
     if (!input) continue;
     if (typeof value === 'boolean') input.checked = value;
-    else input.value = String(value);
+    else input.value = value == null ? '' : String(value);
   }
 }
 function cleanAuth() {
@@ -383,16 +395,22 @@ async function updateCredential() {
   const tick = ++credentialQuery;
   field('password').placeholder = '';
   find('#forget-password').hidden = true;
-  find('#credential-status').textContent = '';
+  find('#credential-status').textContent = authTargetChanged ? '连接目标或账号已更改，请确认并重新填写密码；记住密码选项仍保留。' : '';
   if (field('kind').value !== 'ssh' || field('method').value !== 'password') return;
   const config = profileSchema.safeParse({ kind: 'ssh', name: 'SSH', host: field('host').value,
     port: Number(field('port').value), username: field('username').value });
   if (!config.success || config.data.kind !== 'ssh') return;
-  const saved = await api.credential(config.data);
+  let saved: boolean;
+  try { saved = await api.credential(config.data); }
+  catch (error) {
+    if (tick === credentialQuery && connectDialog.open) find('#credential-status').textContent = message(error);
+    return;
+  }
   if (tick !== credentialQuery || !connectDialog.open) return;
   find('#forget-password').hidden = !saved;
   field('password').placeholder = saved ? '留空使用已保存的密码' : '';
-  find('#credential-status').textContent = saved ? '此目标已保存密码。勾选记住密码并输入新密码可替换。' : '';
+  find('#credential-status').textContent = saved ? '密码已保存（当前 Windows 用户）。留空使用，输入新密码并勾选记住密码可替换。'
+    : authTargetChanged ? '连接目标或账号已更改，请确认并重新填写密码；记住密码选项仍保留。' : '此目标尚未保存密码';
 }
 
 function openConnect(kind: Profile['kind'], mode: typeof connectMode = 'quick', config?: Profile, previous?: Tab) {
@@ -405,6 +423,8 @@ function openConnect(kind: Profile['kind'], mode: typeof connectMode = 'quick', 
   assign(connectForm, { ...serialDefaults, ...sshDefaults, ...(config ?? (kind === 'ssh' ? sshDefaults : serialDefaults)), kind });
   setLogDirectory(config?.kind === 'serial' ? config.logDirectory ?? '' : '');
   cleanAuth();
+  authEndpoint = formEndpoint();
+  authTargetChanged = false;
   if (config?.kind === 'ssh') assign(connectForm, { method: config.method ?? 'password', privateKey: config.privateKey ?? '' });
   field('kind').disabled = mode === 'auth';
   for (const name of ['name', 'group', 'keywords', 'host', 'port', 'username']) field(name).readOnly = mode === 'auth';
@@ -449,11 +469,16 @@ async function submitConnect(event: SubmitEvent) {
     const save = button?.value === 'save' || ['save', 'edit', 'recent', 'tab'].includes(connectMode);
     const password = field('password').value;
     const isPassword = config.kind === 'ssh' && field('method').value === 'password';
-    const remember = isPassword && field('rememberPassword').checked && !!password;
+    const rememberRequested = isPassword && field('rememberPassword').checked;
+    if (rememberRequested && !password && config.kind === 'ssh' && !await api.credential(config)) {
+      throw new Error('已勾选记住密码，请填写此目标的密码后再保存');
+    }
+    const remember = rememberRequested && !!password;
     const forget = isPassword && !find('#forget-password').hidden && field('forgetPassword').checked;
     if (remember && forget) throw new Error('请选择替换密码或清除密码');
     if (config.kind === 'ssh' && forget) await api.credential(config, { action: 'clear' });
     if (config.kind === 'ssh' && remember && save) await api.credential(config, { action: 'save', password });
+    if (config.kind === 'ssh' && remember && save) showNotice('SSH 密码已保存（Windows 用户保护，已验证可读取）');
     if (connectMode === 'recent' && editingRecent) {
       renderRecentConnections(await api.editRecent(editingRecent, config));
       connectDialog.close();
@@ -498,7 +523,12 @@ field('kind').onchange = () => {
 };
 field('method').onchange = () => { updateForm(); safe(updateCredential()); };
 for (const name of ['host', 'port', 'username']) field(name).oninput = () => {
-  assign(connectForm, { password: '', passphrase: '', rememberPassword: false, forgetPassword: false });
+  const next = formEndpoint();
+  if (next !== authEndpoint) {
+    authTargetChanged = !!field('password').value || !!field('passphrase').value || authTargetChanged;
+    assign(connectForm, { password: '', passphrase: '', forgetPassword: false });
+    authEndpoint = next;
+  }
   safe(updateCredential());
 };
 find('#refresh-ports').onclick = () => safe(refreshPorts());
@@ -580,7 +610,7 @@ function disableGpu(tab: Tab) {
 }
 
 function restoreTerminalFocus() {
-  if (!document.querySelector('dialog[open]')) active?.term.focus();
+  if (!document.querySelector('dialog:modal')) active?.term.focus();
 }
 
 function renderPanes() {
@@ -589,6 +619,7 @@ function renderPanes() {
     const index = shown.indexOf(tab);
     const mount = find('.terminal-mount', tab.surface);
     tab.tab.setAttribute('aria-selected', String(tab === active));
+    tab.surface.dataset.active = String(tab === active);
     tab.surface.hidden = index < 0;
     if (index < 0) {
       observer.unobserve(mount);
@@ -606,7 +637,6 @@ function renderPanes() {
     button.disabled = false;
     button.setAttribute('aria-pressed', String(surfaces.dataset.split === direction));
   }
-  find('#split-swap').hidden = find('#split-close').hidden = !split;
   divider.hidden = !split;
   divider.setAttribute('aria-orientation', surfaces.dataset.split === 'stack' ? 'horizontal' : 'vertical');
   for (const [index, pane] of shown.entries()) {
@@ -712,12 +742,12 @@ function updateTabShortcuts() {
     const shortcut = index < 9 ? `Alt+${index + 1}` : '';
     if (shortcut) tab.tab.setAttribute('aria-keyshortcuts', shortcut);
     else tab.tab.removeAttribute('aria-keyshortcuts');
-    tab.tab.title = [endpoint(tab.profile), shortcut, '拖拽交换位置'].filter(Boolean).join(' · ');
+    tab.tab.title = [tab.profile.name, endpoint(tab.profile), shortcut, '拖拽交换位置'].filter(Boolean).join(' · ');
   });
 }
 
 window.addEventListener('keydown', event => {
-  if (event.isComposing || !event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || document.querySelector('dialog[open]')) return;
+  if (event.isComposing || !event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || document.querySelector('dialog:modal')) return;
   const digit = /^Digit([1-9])$/.exec(event.code);
   const tab = digit && orderedTabs()[Number(digit[1]) - 1];
   if (!tab) return;
@@ -737,6 +767,8 @@ function updateFooter() {
   find('#global-endpoint').textContent = active?.warning ?? active?.detail ?? '';
   find('#global-size').textContent = active ? `${active.term.cols} × ${active.term.rows}` : '';
   find('#global-renderer').textContent = active ? (active.gl ? 'WebGL' : 'DOM') : '';
+  updateToolbar();
+  aiUI.refreshSources();
 }
 
 function setTimer(tab: Tab) {
@@ -824,7 +856,7 @@ function bindSurface(tab: Tab) {
     fitTab(tab);
     tab.term.focus();
   }
-  get('.search-toggle').onclick = showSearch;
+  tab.actions.search = showSearch;
   get('.search-close').onclick = hideSearch;
   get('.search-next').onclick = () => search();
   get('.search-prev').onclick = () => search(true);
@@ -845,7 +877,7 @@ function bindSurface(tab: Tab) {
       event.preventDefault();
       if (key === 'c' && tab.term.hasSelection()) safe(api.copy(tab.term.getSelection()));
       if (key === 'v') safe(api.paste().then(value => {
-        if (value && active === tab && !document.querySelector('dialog[open]')) tab.term.paste(value);
+        if (value && active === tab && !document.querySelector('dialog:modal')) tab.term.paste(value);
       }));
       if (key === 'f') showSearch();
     }
@@ -864,28 +896,27 @@ function bindSurface(tab: Tab) {
   });
   tab.term.onBinary(data => { if (tab.state === 'connected') api.write(tab.id, data, true); });
   tab.term.onResize(size => api.resize(tab.id, size));
-  get('.session-logs').onclick = () => safe(api.showLogs(tab.id));
-  get('.open-sftp').onclick = () => openSftp(tab.id);
-  get('.open-forward').onclick = () => {
+  tab.actions.logs = () => safe(api.showLogs(tab.id));
+  tab.actions.sftp = () => openSftp(tab.id);
+  tab.actions.forward = () => {
     forwardTab = tab;
     find('#active-forwards').replaceChildren();
     find('#forward-status').textContent = '';
     forwardDialog.showModal();
     safe(refreshForwards(tab));
   };
-  get('.disconnect').onclick = () => safe(api.disconnect(tab.id).then(restoreTerminalFocus));
-  get('.serial-break').onclick = () => safe(api.serialBreak(tab.id).then(restoreTerminalFocus));
-  const recording = get<HTMLButtonElement>('.record-log');
-  recording.onclick = () => {
-    recording.disabled = true;
-    const enabled = recording.getAttribute('aria-pressed') === 'false';
+  tab.actions.disconnect = () => safe(api.disconnect(tab.id).then(restoreTerminalFocus));
+  tab.actions.break = () => safe(api.serialBreak(tab.id).then(restoreTerminalFocus));
+  tab.actions.record = () => {
+    tab.recordPending = true;
+    updateToolbar();
+    const enabled = !tab.recording;
     safe(api.record(tab.id, enabled).then(() => {
-      recording.setAttribute('aria-pressed', String(enabled));
-      recording.textContent = enabled ? '停止记录' : '开始记录';
+      tab.recording = enabled;
       restoreTerminalFocus();
-    }).finally(() => { recording.disabled = false; }));
+    }).finally(() => { tab.recordPending = false; updateToolbar(); }));
   };
-  get('.reconnect').onclick = () => {
+  tab.actions.reconnect = () => {
     const config = tab.reconnectProfile ?? (tab.profile.kind !== 'local' && tab.profile.id
       ? profiles.find(saved => saved.id === (tab.profile as SavedProfile).id) : undefined) ?? tab.profile;
     if (config.kind === 'local') {
@@ -895,18 +926,15 @@ function bindSurface(tab: Tab) {
     openConnect(config.kind, config.kind === 'ssh' ? 'auth' : 'quick', config, tab);
   };
   const timerPanel = get('.timer-panel');
-  const timerToggle = get('.timer-toggle');
-  timerPanel.hidden = timerToggle.hidden = tab.profile.kind !== 'serial';
-  timerToggle.setAttribute('aria-expanded', String(!timerPanel.hidden));
+  timerPanel.hidden = tab.profile.kind !== 'serial';
   const timerExpand = get('.timer-expand');
   function collapseTimer(collapsed: boolean) {
     timerPanel.hidden = collapsed;
     timerExpand.hidden = !collapsed;
-    timerToggle.setAttribute('aria-expanded', String(!timerPanel.hidden));
     fitTab(tab);
     tab.term.focus();
   }
-  timerToggle.onclick = () => collapseTimer(!timerPanel.hidden);
+  tab.actions.timer = () => collapseTimer(!timerPanel.hidden);
   timerExpand.onclick = () => collapseTimer(false);
   get('.timer-collapse').onclick = () => collapseTimer(true);
   const timerForm = get<HTMLFormElement>('.timer-form');
@@ -946,7 +974,6 @@ async function openTab(profile: SessionProfile, auth?: Auth, passwordOptions?: P
   surface.id = 'surface-' + id;
   surface.setAttribute('role', 'tabpanel');
   surface.setAttribute('aria-labelledby', 'tab-' + id);
-  find('.endpoint', surface).textContent = endpoint(profile);
   surfaces.append(surface);
   const wrapper = document.createElement('div');
   wrapper.className = 'tab-wrapper';
@@ -969,7 +996,7 @@ async function openTab(profile: SessionProfile, auth?: Auth, passwordOptions?: P
   close.ariaLabel = `关闭 ${profile.name}`;
   wrapper.append(button, close);
   tabList.append(wrapper);
-  const tab: Tab = { id, profile, term, fit, search, surface, tab: button, wrapper, state: 'connecting', detail: endpoint(profile) };
+  const tab: Tab = { id, profile, term, fit, search, surface, tab: button, wrapper, state: 'connecting', detail: endpoint(profile), actions: {}, recording: true };
   tabs.set(id, tab);
   bindTabDrag(tab);
   if (profile.kind !== 'local') bindProfileMenu(wrapper, profile, undefined, tab);
@@ -986,6 +1013,7 @@ async function openTab(profile: SessionProfile, auth?: Auth, passwordOptions?: P
   focusTab(tab);
   try {
     await api.open({ id, profile, auth, ...passwordOptions, size: { cols: term.cols, rows: term.rows } });
+    if (passwordOptions?.rememberPassword) showNotice('SSH 密码已保存（Windows 用户保护，已验证可读取）');
   } catch (error) {
     removeTab(tab);
     throw error;
@@ -1024,7 +1052,7 @@ async function closeTab(tab: Tab) {
 }
 
 function nextKey() {
-  if (pendingKey || document.querySelector('dialog[open]')) return;
+  if (pendingKey || document.querySelector('dialog:modal')) return;
   while (keys.length) {
     const key = keys.shift()!;
     if (tabs.get(key.id)?.state !== 'connecting') continue;
@@ -1048,6 +1076,7 @@ find('#reject-key').onclick = () => decideKey(false);
 find('#accept-key').onclick = () => decideKey(true);
 
 function handleSession(event: SessionEvent) {
+  if (event.type === 'ai-progress') return;
   if (event.type === 'history') {
     renderRecentConnections(event.recentConnections);
     return;
@@ -1059,15 +1088,6 @@ function handleSession(event: SessionEvent) {
     tab.detail = event.detail;
     tab.logDir = event.logDir;
     find('.status-dot', tab.tab).dataset.state = event.state;
-    const logs = find<HTMLButtonElement>('.session-logs', tab.surface);
-    logs.disabled = !event.logDir;
-    if (event.logDir) logs.title = event.logDir;
-    find('.reconnect', tab.surface).hidden = event.state !== 'disconnected';
-    find('.disconnect', tab.surface).hidden = event.state !== 'connected';
-    find('.record-log', tab.surface).hidden = event.state !== 'connected';
-    find('.serial-break', tab.surface).hidden = event.state !== 'connected' || tab.profile.kind !== 'serial';
-    find('.open-sftp', tab.surface).hidden = event.state !== 'connected' || tab.profile.kind !== 'ssh';
-    find('.open-forward', tab.surface).hidden = event.state !== 'connected' || tab.profile.kind !== 'ssh';
     if (event.state === 'disconnected') {
       if (pendingKey?.id === tab.id) { pendingKey = undefined; keyDialog.close(); nextKey(); }
       if (!tab.closing) showNotice(`${tab.profile.name} · ${event.detail}`);
@@ -1092,13 +1112,125 @@ function handleSession(event: SessionEvent) {
   if (active === tab && (event.type === 'connection' || event.type === 'error')) updateFooter();
 }
 
+function readablePanes(): ReadablePane[] {
+  return orderedTabs().filter(tab => tab.profile.kind !== 'local').map(tab => ({
+    id: tab.id, name: tab.profile.name, endpoint: endpoint(tab.profile),
+    kind: tab.profile.kind === 'serial' ? 'serial' : 'ssh', connected: tab.state === 'connected',
+    position: split?.includes(tab) ? (surfaces.dataset.split === 'stack' ? ['上方窗格', '下方窗格'] : ['左侧窗格', '右侧窗格'])[split.indexOf(tab)]
+      : tab === active ? '当前标签' : '后台标签',
+    read: () => {
+      const buffer = tab.term.buffer.active;
+      return Array.from({ length: tab.term.rows }, (_, row) => buffer.getLine(buffer.viewportY + row)?.translateToString(true) ?? '').join('\n').trimEnd();
+    },
+    selection: () => tab.term.getSelection(),
+  }));
+}
+function showSettings(ai = false) {
+  assign(find<HTMLFormElement>('#settings-form'), preferences);
+  settingsDialog.showModal();
+  selectSettings(ai);
+}
+function selectSettings(ai: boolean) {
+  find('#settings-form').hidden = ai;
+  find('#ai-settings-form').hidden = !ai;
+  find('#settings-terminal-tab').setAttribute('aria-selected', String(!ai));
+  find('#settings-ai-tab').setAttribute('aria-selected', String(ai));
+  if (ai) void aiUI.loadSettings();
+}
+const aiUI = createAiPanel(api, readablePanes, () => active?.id, () => showSettings(true), restoreTerminalFocus);
+find('#open-ai-chat').onclick = () => aiUI.open('dialog');
+
+const topMenu = find('#top-menu');
+const topMore = find<HTMLButtonElement>('#top-more');
+let capturedSelection: { pane?: ReadablePane; text: string } = { text: '' };
+const actionLabels: Record<TopAction, string> = {
+  search: '搜索', logs: '日志', record: '停止记录', disconnect: '断开', sftp: 'SFTP', forward: '端口转发', reconnect: '重连', timer: '定时发送 / 重启测试', break: 'Serial Break',
+};
+function canAct(action: TopAction) {
+  const tab = active;
+  if (!tab) return false;
+  if (action === 'search') return true;
+  if (action === 'logs') return !!tab.logDir;
+  if (action === 'timer') return tab.profile.kind === 'serial';
+  if (action === 'reconnect') return tab.state === 'disconnected';
+  if (action === 'sftp' || action === 'forward') return tab.state === 'connected' && tab.profile.kind === 'ssh';
+  if (action === 'break') return tab.state === 'connected' && tab.profile.kind === 'serial';
+  return tab.state === 'connected' && !(action === 'record' && tab.recordPending);
+}
+function actionLabel(action: TopAction) { return action === 'record' && !active?.recording ? '开始记录' : actionLabels[action]; }
+function updateToolbar() {
+  const address = find('#active-endpoint');
+  address.textContent = active ? endpoint(active.profile) : '';
+  address.title = active ? `${active.profile.name} · ${endpoint(active.profile)}` : '';
+  for (const button of document.querySelectorAll<HTMLButtonElement>('[data-action]')) {
+    const action = button.dataset.action as TopAction;
+    button.disabled = !canAct(action);
+    button.title = action === 'logs' && active?.logDir ? active.logDir : actionLabel(action);
+    button.ariaLabel = actionLabel(action);
+    if (button.closest('#top-menu')) find('span', button).textContent = actionLabel(action);
+    if (action === 'record') button.setAttribute('aria-pressed', String(!!active?.recording));
+  }
+}
+function act(action: TopAction) { if (canAct(action)) active?.actions[action]?.(); }
+function closeTopMenu() { topMenu.hidden = true; topMore.setAttribute('aria-expanded', 'false'); }
+function captureSelection() {
+  const pane = readablePanes().find(pane => pane.id === active?.id);
+  capturedSelection = { pane, text: pane?.selection() ?? '' };
+}
+topMore.onpointerdown = captureSelection;
+function menuItem(label: string, run: () => void, disabled = false, name?: IconName) {
+  const button = document.createElement('button');
+  button.type = 'button'; button.role = 'menuitem'; button.disabled = disabled;
+  const text = document.createElement('span'); text.textContent = label;
+  if (name) button.append(icon(name));
+  button.append(text);
+  button.onclick = () => { closeTopMenu(); run(); };
+  return button;
+}
+topMore.onclick = event => {
+  if (!topMenu.hidden) { closeTopMenu(); restoreTerminalFocus(); return; }
+  if (event.detail === 0) captureSelection();
+  const actions = (Object.keys(actionLabels) as TopAction[]).map(action => {
+    const button = menuItem(actionLabel(action), () => act(action), !canAct(action), action === 'break' ? 'disconnect' : action);
+    button.dataset.action = action;
+    return button;
+  });
+  topMenu.replaceChildren(
+    menuItem('快速连接 SSH', () => openConnect('ssh')),
+    menuItem('快速连接串口', () => openConnect('serial')),
+    menuItem('打开 PowerShell', () => safe(openTab(localDefaults))),
+    menuItem('左右分屏', () => chooseSplit('side'), tabs.size < 2, 'side'),
+    menuItem('上下分屏', () => chooseSplit('stack'), tabs.size < 2, 'stack'),
+    menuItem('交换窗格', () => { if (split && active) { split.reverse(); focusTab(active); } }, !split, 'forward'),
+    menuItem('关闭分屏', closeSplit, !split),
+    ...actions,
+    menuItem('AI 对话', () => aiUI.open('dialog'), false, 'ai'),
+    menuItem('AI 日志分析', () => aiUI.open('dock'), false, 'ai'),
+    menuItem('分析选中日志', () => { void aiUI.analyzeSelection(capturedSelection.pane, capturedSelection.text); }, false, 'ai'),
+    menuItem('设置', () => showSettings()),
+  );
+  topMenu.hidden = false; topMore.setAttribute('aria-expanded', 'true');
+  topMenu.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
+};
+topMenu.onkeydown = event => {
+  if (event.key === 'Escape') { event.preventDefault(); closeTopMenu(); restoreTerminalFocus(); }
+  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+  event.preventDefault();
+  const buttons = Array.from(topMenu.querySelectorAll<HTMLButtonElement>('button:not(:disabled)'));
+  const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+  buttons[event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : buttons.length - 1)) % buttons.length]?.focus();
+};
+document.addEventListener('pointerdown', event => { if (event.target instanceof Node && !topMenu.contains(event.target) && !topMore.contains(event.target)) closeTopMenu(); });
+for (const button of document.querySelectorAll<HTMLButtonElement>('.top-tools [data-action]')) button.onclick = () => act(button.dataset.action as TopAction);
+for (const element of document.querySelectorAll<HTMLElement>('[data-icon]')) element.prepend(icon(element.dataset.icon as IconName));
+
 const commandBar = createCommandBar(api, (groupId, buttonId) => {
   const tab = active;
   if (tab?.state !== 'connected') return;
   safe(api.runCommand(tab.id, groupId, buttonId).then(() => {
-    if (active === tab && !document.querySelector('dialog[open]')) tab.term.focus();
+    if (active === tab && !document.querySelector('dialog:modal')) tab.term.focus();
   }));
-}, nextKey);
+}, () => { nextKey(); restoreTerminalFocus(); });
 api.onSession(handleSession);
 const sidebarToggle = find<HTMLButtonElement>('#sidebar-toggle');
 const sidebar = find('#session-sidebar');
@@ -1117,12 +1249,11 @@ for (const button of document.querySelectorAll<HTMLButtonElement>('button[data-s
 }
 find('#split-side').onclick = () => chooseSplit('side');
 find('#split-stack').onclick = () => chooseSplit('stack');
-find('#split-swap').onclick = () => { if (split && active) { split.reverse(); focusTab(active); } };
-find('#split-close').onclick = () => {
+function closeSplit() {
   split = undefined;
   delete surfaces.dataset.split;
   if (active) focusTab(active);
-};
+}
 async function refreshForwards(tab: Tab) {
   const entries = await api.listForwards(tab.id);
   if (tab !== forwardTab || !forwardDialog.open) return;
@@ -1172,16 +1303,15 @@ find<HTMLFormElement>('#local-form').onsubmit = event => {
     safe(openTab(config));
   } catch (error) { showNotice(message(error)); }
 };
-for (const dialog of document.querySelectorAll('dialog')) {
+for (const dialog of document.querySelectorAll('dialog:not(#ai-dialog)')) {
   dialog.addEventListener('close', () => { nextKey(); restoreTerminalFocus(); });
 }
 renderPanes();
 find('#new-profile').onclick = () => openConnect('serial', 'save');
 find('#all-logs').onclick = () => safe(api.showLogs());
-find('#settings').onclick = () => {
-  assign(find<HTMLFormElement>('#settings-form'), preferences);
-  settingsDialog.showModal();
-};
+find('#settings').onclick = () => showSettings();
+find('#settings-terminal-tab').onclick = () => selectSettings(false);
+find('#settings-ai-tab').onclick = () => selectSettings(true);
 settingsDialog.addEventListener('close', nextKey);
 find<HTMLFormElement>('#settings-form').onsubmit = event => {
   event.preventDefault();

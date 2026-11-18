@@ -4,8 +4,9 @@ import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
 import { errorText, type SerialProvider } from './session';
 import { createController } from './controller';
+import type { AiTransport } from './ai';
 
-export function startApp(options: { serial?: SerialProvider; dataDirectory?: string } = {}) {
+export function startApp(options: { serial?: SerialProvider; dataDirectory?: string; aiTransport?: AiTransport } = {}) {
   app.setName('TermDock');
   if (process.platform === 'win32') app.setAppUserModelId('TermDock.Desktop');
   if (options.dataDirectory) app.setPath('userData', options.dataDirectory);
@@ -50,7 +51,7 @@ export function startApp(options: { serial?: SerialProvider; dataDirectory?: str
   void app.whenReady().then(() => {
     controller = createController(app.getPath('userData'), event => {
       if (window && !window.isDestroyed()) window.webContents.send('td:session', event);
-    }, options.serial);
+    }, options.serial, options.aiTransport);
     Menu.setApplicationMenu(null);
 
     for (const [name, run] of Object.entries(controller.requests)) {

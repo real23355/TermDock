@@ -69,8 +69,10 @@ try {
   const bin = join(stage, 'bin');
   const ui = join(portable, 'ui');
   const backend = join(portable, 'backend');
+  const reportDirectory = join(portable, 'docs', '0.0.3');
   await mkdir(portable);
   await Promise.all([sdk, bin, ui, backend].map(path => mkdir(path)));
+  await mkdir(reportDirectory, { recursive: true });
   run('tar.exe', ['-xf', sdkArchive, '-C', sdk, 'LICENSE.txt', 'NOTICE.txt', 'lib/net462', 'runtimes/win-x64/native/WebView2Loader.dll']);
   run('tar.exe', ['-xf', nodeArchive, '-C', bin, 'package/bin/node.exe']);
   run('tar.exe', ['-xf', zipArchive, '-C', bin, 'package/win/x64/7za.exe']);
@@ -120,6 +122,8 @@ try {
     cp(forms, join(portable, 'Microsoft.Web.WebView2.WinForms.dll')),
     cp(join(sdk, 'runtimes', 'win-x64', 'native', 'WebView2Loader.dll'), join(portable, 'WebView2Loader.dll')),
     cp('README.md', join(portable, 'README.md')),
+    cp('ACCEPTANCE-0.0.3.md', join(portable, 'ACCEPTANCE-0.0.3.md')),
+    cp('docs/0.0.3/layout-and-credentials.md', join(reportDirectory, 'layout-and-credentials.md')),
     writeFile(join(portable, 'Create-Start-Menu-Shortcut.cmd'), '@echo off\r\nstart "" "%~dp0TermDock.exe" --register-start-menu\r\n'),
     writeFile(join(portable, 'runtime.sha256'), nodeHash + '\n'),
   ]);

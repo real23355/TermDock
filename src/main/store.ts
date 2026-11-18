@@ -3,13 +3,14 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import {
-  commandGroupsSchema, defaults, preferencesSchema, profile, recentConnectionSchema,
+  aiDefaults, aiSettingsSchema, commandGroupsSchema, defaults, preferencesSchema, profile, recentConnectionSchema,
   type CommandGroup, type Preferences, type Profile, type RecentConnection, type SavedProfile,
 } from '../shared';
 
 const settingsSchema = z.object({
   preferences: preferencesSchema,
   hosts: z.record(z.string(), z.string()),
+  ai: aiSettingsSchema.default(aiDefaults),
 });
 const legacySettingsSchema = settingsSchema.extend({
   profiles: z.unknown().optional(),
@@ -77,7 +78,7 @@ export class Store {
 
     const savedSettings = readFile(this.settingsFile);
     const legacy = savedSettings === undefined ? undefined : validate(this.settingsFile, legacySettingsSchema, savedSettings);
-    this.settings = { preferences: legacy?.preferences ?? defaults, hosts: legacy?.hosts ?? {} };
+    this.settings = { preferences: legacy?.preferences ?? defaults, hosts: legacy?.hosts ?? {}, ai: legacy?.ai ?? aiDefaults };
 
     const savedSessions = readFile(this.sessionsFile);
     const sessions = savedSessions === undefined
@@ -104,6 +105,8 @@ export class Store {
   get recentConnections() { return this.sessions.recentConnections; }
   get preferences() { return this.settings.preferences; }
   get commandGroups() { return this.buttons.commandGroups; }
+  get ai() { return this.settings.ai; }
+  setAi(ai: z.infer<typeof aiSettingsSchema>) { this.updateSettings({ ai }); }
 
   private updateSessions(changes: Partial<Sessions>) {
     const sessions = { ...this.sessions, ...changes };

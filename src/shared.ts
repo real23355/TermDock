@@ -107,6 +107,30 @@ export type CommandGroup = z.infer<typeof commandGroupsSchema>[number];
 export type CommandButton = z.infer<typeof commandButtonSchema>;
 
 export const defaults: Preferences = { font: 'macOS', fontSize: 15, scrollback: 10000, gpu: true };
+export const aiDefaults = { model: 'GLM-5.3-Flash-NVFP4' };
+export const aiSettingsSchema = z.object({ model: z.string().trim().min(1, '请输入模型全名').max(160).regex(/^[^\x00-\x1f\x7f]+$/, '模型名包含无效字符') });
+export const aiSourceSchema = z.object({
+  id: z.string().min(1).max(100), name: z.string().max(400), endpoint: z.string().max(400),
+  position: z.string().max(80), readAt: z.iso.datetime(), text: z.string().min(1).max(240000),
+});
+export const aiMessageSchema = z.object({ role: z.literal(['user', 'assistant']), content: z.string().min(1).max(60000) });
+export const aiChatSchema = z.object({ id, sources: aiSourceSchema.array().max(40), messages: aiMessageSchema.array().min(1).max(40) });
+export const aiActionSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('send'), text: z.string().max(2048).refine(value => !/[\x00-\x1f\x7f]/.test(value), 'AI 只能发送单行文本'),
+    lineEnding: z.literal(['CR', 'LF', 'CRLF', 'none']).default('CR'), waitMs: z.number().int().min(250).max(10000).default(1500) }).strict()
+    .refine(value => value.text.length > 0 || value.lineEnding !== 'none', '不能发送空内容'),
+  z.object({ type: z.literal('wait'), waitMs: z.number().int().min(250).max(10000).default(1500) }).strict(),
+]);
+export const aiAssistSchema = aiChatSchema.extend({ serialTargetId: id });
+export type AiAction = z.infer<typeof aiActionSchema>;
+export type AiObservation = { text: string; bytes: number; truncated: boolean; written: boolean; readAt: string };
+export type AiAssistEvent = { id: string; type: 'ai-progress'; runId: string; step: number;
+  phase: 'planning' | 'sending' | 'written' | 'observed' | 'finished'; detail: string; action?: AiAction; observation?: AiObservation };
+export type AiAssistResult = { reply: string; steps: number; writes: number; limited: boolean };
+export type AiSettings = z.infer<typeof aiSettingsSchema> & { keySaved: boolean; keyError?: string };
+export type AiSource = z.infer<typeof aiSourceSchema>;
+export type AiMessage = z.infer<typeof aiMessageSchema>;
+export type AiChat = z.infer<typeof aiChatSchema>;
 export const localDefaults: LocalProfile = { kind: 'local', name: 'PowerShell', shell: 'powershell' };
 export const serialDefaults: SerialProfile = {
   kind: 'serial', name: 'PL2303', path: '', baudRate: 921600,
@@ -128,6 +152,7 @@ export type ForwardOptions = { localPort: number; host: string; port: number };
 export type Forward = ForwardOptions & { id: string };
 export type HostKey = { id: string; token: string; host: string; port: number; fingerprint: string };
 export type SessionEvent =
+  | AiAssistEvent
   | { id: string; type: 'connection'; state: ConnectionState; detail: string; logDir?: string }
   | { id: string; type: 'history'; recentConnections: RecentConnection[] }
   | { id: string; type: 'timer'; state: TimerState }
@@ -144,6 +169,12 @@ export type DesktopApi = {
   deleteProfile(id: string): Promise<void>;
   editRecent(old: RecentConnection, value: Profile): Promise<RecentConnection[]>;
   credential(config: SshProfile, change?: { action: 'save' | 'clear'; password?: string }): Promise<boolean>;
+  aiSettings(): Promise<AiSettings>;
+  saveAiSettings(value: { model: string; key?: string; clear?: boolean }): Promise<AiSettings>;
+  testAi(value: { id: string; model: string; key?: string }): Promise<string>;
+  aiChat(value: AiChat): Promise<string>;
+  aiAssist(value: AiChat & { serialTargetId: string }): Promise<AiAssistResult>;
+  cancelAi(id: string): Promise<void>;
   savePreferences(value: Preferences): Promise<Preferences>;
   saveCommandGroups(groups: CommandGroup[]): Promise<CommandGroup[]>;
   runCommand(id: string, groupId: string, buttonId: string): Promise<void>;

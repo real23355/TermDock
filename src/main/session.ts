@@ -4,7 +4,7 @@ import type { Duplex } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client, type ClientChannel, type SFTPWrapper } from 'ssh2';
 import { SerialPort } from 'serialport';
-import type { Auth, Forward, ForwardOptions, LocalProfile, OpenRequest, PortInfo, SerialProfile, SessionEvent, Size, SshProfile, TimerOptions } from '../shared';
+import { lineEndings, type AiAction, type AiObservation, type Auth, type Forward, type ForwardOptions, type LocalProfile, type OpenRequest, type PortInfo, type SerialProfile, type SessionEvent, type Size, type SshProfile, type TimerOptions } from '../shared';
 import { SessionLogs } from './logs';
 import { SecretEchoFilter } from './secret-echo';
 import { LocalPty } from './local-pty';
@@ -36,6 +36,7 @@ export const systemSerial: SerialProvider = {
 };
 
 export function errorText(error: unknown) { return error instanceof Error ? error.message : String(error); }
+export type AiSerialLease = { label: string; exchange(action: AiAction, signal: AbortSignal, written: () => void): Promise<AiObservation>; release(): void };
 
 const displayLimit = 1024 * 1024;
 const displayBatch = 128 * 1024;
@@ -66,6 +67,10 @@ export class Session {
   private inFlight = 0;
   private inputOverflow = false;
   private sendingBreak = false;
+  private serialConfig?: SerialProfile;
+  private aiOwner?: { runId: string; cancel: (reason: string) => void };
+  private aiWritePending = false;
+  private aiReceivers = new Set<(bytes: Buffer) => void>();
 
   constructor(
     request: OpenRequest,
@@ -75,6 +80,7 @@ export class Session {
     private serialProvider: SerialProvider,
   ) {
     this.id = request.id;
+    this.serialConfig = request.profile.kind === 'serial' ? request.profile : undefined;
     this.size = request.size;
     this.connection('connecting', '正在建立连接');
     this.connecting = this.connect(request, logRoot);
@@ -88,6 +94,7 @@ export class Session {
     const root = serial?.logDirectory ?? logRoot;
     const logs = await SessionLogs.create(root, request.profile.name, serial?.logFormat === 'timestamped', error => {
       this.timer?.stop('日志写入失败', true);
+      this.aiOwner?.cancel('log');
       this.error(`日志写入失败：${error}`);
     }, paused => {
       const streams = [this.serial, this.channel, this.channel?.stderr, this.local?.output];
@@ -218,6 +225,7 @@ export class Session {
   private deliver(bytes: Buffer) {
     if (!bytes.length) return;
     this.logs?.receive(bytes);
+    for (const receive of this.aiReceivers) receive(bytes);
     this.output.push(bytes);
     this.outputBytes += bytes.length;
     while (this.outputBytes > displayLimit && this.output.length) {
@@ -264,10 +272,83 @@ export class Session {
     });
   }
 
+  acquireAiSerial(runId: string, cancel: (reason: string) => void): AiSerialLease {
+    const port = this.serial;
+    const config = this.serialConfig;
+    if (!config || this.state !== 'connected' || !port?.isOpen) throw new Error('请选择已连接的串口作为 AI 发送目标');
+    if (!this.logs?.healthy) throw new Error('日志不可用，AI 串口操作已停止');
+    if (this.timer?.busy) throw new Error('请先停止此串口的定时任务或重启测试');
+    if (this.timer?.manualPending) throw new Error('串口有未结束的手动输入，请先完成或取消该输入');
+    if (this.aiOwner || this.aiWritePending || port.writableLength || this.sendingBreak) throw new Error('此串口已有操作正在进行，请稍后重试');
+    const owner = this.aiOwner = { runId, cancel };
+    this.logs.event('ai_started', `run=${runId}`);
+    return { label: `${config.name} · ${config.path}`, exchange: (action, signal, written) => this.aiExchange(owner, port, action, signal, written),
+      release: () => {
+        if (this.aiOwner !== owner) return;
+        this.aiOwner = undefined;
+        this.logs?.event('ai_stopped', `run=${runId}`);
+      },
+    };
+  }
+
+  private async aiExchange(owner: NonNullable<Session['aiOwner']>, port: SerialDevice, action: AiAction, signal: AbortSignal, written: () => void): Promise<AiObservation> {
+    signal.throwIfAborted();
+    if (this.aiOwner !== owner || this.state !== 'connected' || !port.isOpen || !this.logs?.healthy) throw new Error('串口或日志不可用，AI 操作已停止');
+    const chunks: Buffer[] = [];
+    let received = 0;
+    let kept = 0;
+    let lastReceived = 0;
+    const receiver = (bytes: Buffer) => {
+      received += bytes.length;
+      lastReceived = Date.now();
+      const part = bytes.subarray(0, Math.max(0, 65536 - kept));
+      if (part.length) { chunks.push(Buffer.from(part)); kept += part.length; }
+    };
+    const aborted = () => { throw signal.reason; };
+    this.aiReceivers.add(receiver); // Capture before the write, including immediate boot/echo bytes.
+    let rejectAbort: (reason?: unknown) => void = () => {};
+    const abortWait = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+    const onAbort = () => rejectAbort(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    const writeTimeout = setTimeout(() => rejectAbort(new Error('串口写入超时，AI 操作已停止')), 10000);
+    try {
+      if (action.type === 'send') {
+        const bytes = Buffer.from(action.text + lineEndings[action.lineEnding]);
+        this.timer?.externalSend();
+        this.logs.event('ai_writing', `run=${owner.runId} bytes=${bytes.length}`);
+        this.aiWritePending = true;
+        const pending = this.sendSerial(port, bytes).then(() => {
+          this.logs?.event('ai_written', `run=${owner.runId} bytes=${bytes.length}`);
+        }).finally(() => { this.aiWritePending = false; });
+        await Promise.race([pending, abortWait]);
+        if (signal.aborted) aborted();
+        written();
+      }
+      clearTimeout(writeTimeout);
+      const started = Date.now();
+      while (Date.now() - started < action.waitMs) {
+        await Promise.race([delay(Math.max(1, Math.min(50, action.waitMs - (Date.now() - started)))), abortWait]);
+        if (signal.aborted) aborted();
+        if (this.state !== 'connected' || !this.logs?.healthy) throw new Error('串口或日志不可用，AI 操作已停止');
+        if (received && Date.now() - started >= 350 && Date.now() - lastReceived >= 350) break;
+      }
+      const observation = { text: Buffer.concat(chunks).toString('utf8'), bytes: received, truncated: received > kept,
+        written: action.type === 'send', readAt: new Date().toISOString() };
+      this.logs.event('ai_observed', `run=${owner.runId} bytes=${received} truncated=${observation.truncated}`);
+      return observation;
+    } finally {
+      clearTimeout(writeTimeout);
+      signal.removeEventListener('abort', onAbort);
+      this.aiReceivers.delete(receiver);
+    }
+  }
+
   write(data: string, binary: boolean) {
     if (this.state !== 'connected') return false;
     const stream = this.serial ?? this.channel ?? this.local?.input;
     if (!stream?.writable) return false;
+    // Device replies and mouse/focus reports are not manual typing.
+    if (data && !/^(?:\x1b\[(?:[?><]?[\d;]+[cRnMmu]|\?\d+;\d+\$y|[IO])|\x1b\[M[\s\S]{3})$/.test(data)) this.aiOwner?.cancel('manual');
     const bytes = Buffer.from(data, binary ? 'latin1' : 'utf8');
     if (stream.writableLength + bytes.length > inputLimit) {
       if (!this.inputOverflow) this.error('终端发送缓冲区已满，部分输入未发送');
@@ -292,6 +373,7 @@ export class Session {
 
   startTimer(options: TimerOptions) {
     if (!this.timer) throw new Error('当前会话没有可用的串口');
+    if (this.aiOwner || this.aiWritePending) throw new Error('AI 正在操作此串口，请先停止 AI 操作');
     this.timer.start(options);
   }
   stopTimer() { this.timer?.stop(); }
@@ -347,6 +429,7 @@ export class Session {
   }
 
   async serialBreak() {
+    this.aiOwner?.cancel('manual');
     const port = this.serial;
     if (this.state !== 'connected' || !port?.isOpen || !port.set || this.sendingBreak) {
       throw new Error('串口 Break 当前不可用');
@@ -377,6 +460,7 @@ export class Session {
     // Stop writes immediately. Update the UI after releasing the device so that
     // a flashing tool can open the COM port as soon as disconnection is shown.
     this.state = 'disconnected';
+    this.aiOwner?.cancel('disconnected');
     if (this.echoFilter) {
       this.logs?.receive(this.echoFilter.finish());
       this.echoFilter = undefined;

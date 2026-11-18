@@ -46,7 +46,7 @@
       </div>
       <div class="sidebar-bottom">
         <button id="all-logs"><span aria-hidden="true">▤</span> 日志目录</button>
-        <button id="settings"><span aria-hidden="true">⚙</span> 终端设置</button>
+        <button id="settings"><span aria-hidden="true">⚙</span> 设置</button>
       </div>
     </aside>
     <section class="workspace" aria-label="终端工作区">
@@ -56,13 +56,23 @@
         </button>
         <div id="tabs" class="tabs" role="tablist" aria-label="打开的会话"></div>
         <span id="tabs-empty">终端</span>
+        <span id="active-endpoint" title=""></span>
+        <div class="top-tools" role="toolbar" aria-label="当前窗格工具">
+          <button id="split-side" data-icon="side" type="button" aria-pressed="false" title="左右分屏" aria-label="左右分屏"></button>
+          <button id="split-stack" data-icon="stack" type="button" aria-pressed="false" title="上下分屏" aria-label="上下分屏"></button>
+          <span class="tool-separator"></span>
+          <button class="search-toggle" data-action="search" data-icon="search" title="搜索 (Ctrl+Shift+F)" aria-label="搜索"></button>
+          <button class="session-logs" data-action="logs" data-icon="logs" title="日志" aria-label="日志" disabled></button>
+          <button class="record-log top-secondary" data-action="record" data-icon="record" title="停止记录" aria-label="停止记录" aria-pressed="true" disabled></button>
+          <button class="disconnect top-secondary" data-action="disconnect" data-icon="disconnect" title="断开" aria-label="断开" disabled></button>
+          <button class="open-sftp top-secondary" data-action="sftp" data-icon="sftp" title="SFTP" aria-label="SFTP" disabled></button>
+          <button class="open-forward top-secondary" data-action="forward" data-icon="forward" title="端口转发" aria-label="端口转发" disabled></button>
+          <button id="open-ai-chat" data-icon="ai" type="button" title="AI 对话" aria-label="AI 对话"></button>
+          <button id="top-more" type="button" aria-haspopup="menu" aria-expanded="false">更多 ▾</button>
+        </div>
+        <div id="top-menu" class="toolbar-menu" role="menu" hidden></div>
       </div>
-      <div class="workspace-toolbar" role="toolbar" aria-label="会话工具栏">
-        <button id="split-side" type="button" aria-pressed="false">左右分屏</button>
-        <button id="split-stack" type="button" aria-pressed="false">上下分屏</button>
-        <button id="split-swap" type="button" hidden>交换窗格</button>
-        <button id="split-close" type="button" hidden>关闭分屏</button>
-      </div>
+      <div class="workspace-body"><div class="terminal-area">
       <div id="empty" class="empty">
         <div class="empty-inner">
           <div class="terminal-mark" aria-hidden="true"><span></span><span></span><span></span><b>&gt;_</b></div>
@@ -75,23 +85,42 @@
         </div>
       </div>
       <div id="surfaces"></div>
+      </div>
+      <aside id="ai-panel" aria-label="AI 对话" hidden>
+        <div class="ai-heading"><h2>AI 对话</h2><span class="status-spacer"></span><button id="ai-new-chat" title="开始新对话">新对话</button><button id="ai-popout" title="弹出对话框">弹出</button><button id="ai-collapse" title="收起 AI 栏" aria-label="收起 AI 栏">×</button></div>
+        <div class="ai-source-section"><div class="ai-source-heading"><span>读取范围 · SSH / 串口</span><button id="ai-configure">设置</button></div>
+          <div id="ai-sources"></div><div class="ai-source-actions"><small>发送问题时自动读取所选画面</small><button id="ai-read">读取并分析</button></div>
+        </div>
+        <div class="ai-operation-controls"><label>操作模式<select id="ai-mode"><option value="chat">仅对话</option><option value="serial">自动操作串口</option></select></label>
+          <label id="ai-target-row" hidden>发送目标<select id="ai-serial-target" aria-label="AI 串口发送目标"><option value="">选择已连接串口</option></select></label>
+          <small id="ai-operation-hint">可直接提问，会附带所选 SSH / 串口内容。</small><div id="ai-run-target" role="status" hidden></div>
+        </div>
+        <div id="ai-context" role="status">尚未读取日志</div>
+        <button id="ai-use-screen" type="button" hidden>改用所选终端当前画面</button>
+        <div id="ai-messages" role="log" aria-label="AI 对话"></div>
+        <p id="ai-status" role="status"></p>
+        <form id="ai-chat-form"><textarea id="ai-question" rows="3" maxlength="60000" aria-label="向 AI 提问" placeholder="直接提问，例如：这段报错是什么原因？帮我在串口查看内存。"></textarea>
+          <div class="ai-chat-actions"><button id="ai-cancel" type="button" hidden>停止</button><span class="status-spacer"></span><button id="ai-send" type="submit">发送</button></div>
+        </form>
+      </aside></div>
     </section>
     <div id="notice" class="notice" role="alert" hidden><span></span><button aria-label="关闭通知">×</button></div>
   </main>
   <section class="command-bar" aria-label="命令按钮栏">
-    <div class="command-bar-tools">
-      <select id="command-group" aria-label="命令分组" disabled><option>命令分组</option></select>
-      <button id="manage-commands" type="button">管理按钮</button>
-    </div>
+    <select id="command-group" aria-label="命令分组" disabled><option>命令分组</option></select>
     <fieldset id="command-buttons" disabled>
       <div id="command-button-list"></div>
     </fieldset>
+    <button id="manage-commands" type="button">管理按钮</button>
+    <button id="command-overflow" type="button" aria-label="更多命令" aria-haspopup="menu" aria-expanded="false" hidden>»</button>
+    <div id="command-overflow-menu" class="toolbar-menu" role="menu" hidden></div>
   </section>
   <footer class="statusbar">
     <i id="global-dot" class="status-dot"></i><span id="global-state">无活动连接</span>
     <span id="global-endpoint" class="muted"></span>
     <span class="status-spacer"></span><span id="global-size"></span><span id="global-renderer"></span>
   </footer>
+  <dialog id="ai-dialog" aria-label="AI 对话框"></dialog>
 
   <dialog id="connect-dialog">
     <form id="connect-form">
@@ -219,8 +248,9 @@
     </form>
   </dialog>
   <dialog id="settings-dialog">
+    <div class="dialog-head"><h2>设置</h2><button type="button" data-dismiss aria-label="关闭">×</button></div>
+    <div class="settings-tabs" role="tablist" aria-label="设置分类"><button id="settings-terminal-tab" role="tab" aria-selected="true">终端</button><button id="settings-ai-tab" role="tab" aria-selected="false">AI</button></div>
     <form id="settings-form">
-      <div class="dialog-head"><h2>终端设置</h2><button type="button" data-dismiss aria-label="关闭">×</button></div>
       <div class="dialog-body form-grid">
         <label>字体<select name="font"><option value="macOS">macOS 风格</option><option>Cascadia Mono</option><option>Consolas</option><option>Lucida Console</option><option>monospace</option></select></label>
         <label>字号<input name="fontSize" type="number" min="9" max="36" required></label>
@@ -228,6 +258,16 @@
         <label class="check"><input name="gpu" type="checkbox"> WebGL GPU 渲染</label>
       </div>
       <div class="dialog-actions"><span class="status-spacer"></span><button type="button" data-dismiss>取消</button><button type="submit" class="primary">应用</button></div>
+    </form>
+    <form id="ai-settings-form" hidden>
+      <div class="dialog-body ai-settings-fields">
+        <label>API Key<input id="ai-key" type="password" autocomplete="off" maxlength="8192" placeholder="留空沿用已保存的 Key"></label>
+        <small id="ai-key-status" role="status"></small>
+        <label>模型全名<input id="ai-model" list="ai-models" required maxlength="160" spellcheck="false" value="GLM-5.3-Flash-NVFP4"></label>
+        <datalist id="ai-models"><option value="GLM-5.3-Flash-NVFP4"></option><option value="DeepSeek-V4.1-Flash-1017"></option></datalist>
+        <p id="ai-settings-status" role="status"></p>
+      </div>
+      <div class="dialog-actions"><button id="ai-clear-key" type="button" class="danger">清除 API Key</button><span class="status-spacer"></span><button id="ai-test" type="button">测试连接</button><button id="ai-save" type="submit" class="primary">保存</button></div>
     </form>
   </dialog>
 
@@ -261,19 +301,7 @@
 
   <template id="surface-template">
     <section class="surface" hidden>
-      <div class="surface-tools">
-        <span class="endpoint"></span><span class="status-spacer"></span>
-        <button class="search-toggle" title="回滚搜索 (Ctrl+Shift+F)">搜索</button>
-        <button class="session-logs" title="打开此会话的日志目录" disabled>日志</button>
-        <button class="record-log" aria-pressed="true" hidden>停止记录</button>
-        <select class="pane-select" hidden aria-label="更换窗格连接"></select>
-        <button class="disconnect" hidden>断开</button>
-        <button class="serial-break" hidden>Break</button>
-        <button class="open-sftp" hidden>SFTP</button>
-        <button class="open-forward" hidden>端口转发</button>
-        <button class="reconnect" hidden>重连</button>
-        <button class="timer-toggle">定时发送</button>
-      </div>
+      <select class="pane-select" hidden aria-label="更换窗格连接"></select>
       <div class="surface-body">
         <div class="terminal-shell">
           <div class="searchbar" hidden>

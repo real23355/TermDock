@@ -1,0 +1,81 @@
+{
+  "viewport": {
+    "width": 1344,
+    "height": 821,
+    "deviceScaleFactor": 1
+  },
+  "terminalFontSize": 15,
+  "uiFontSize": "13px",
+  "top": {
+    "x": 236,
+    "y": 0,
+    "width": 1108,
+    "height": 44,
+    "top": 0,
+    "right": 1344,
+    "bottom": 44,
+    "left": 236
+  },
+  "oldSplitRow": {
+    "x": 236,
+    "y": 44,
+    "width": 1108,
+    "height": 35,
+    "top": 44,
+    "right": 1344,
+    "bottom": 79,
+    "left": 236
+  },
+  "oldSurfaceRow": {
+    "x": 236,
+    "y": 79,
+    "width": 1108,
+    "height": 42,
+    "top": 79,
+    "right": 1344,
+    "bottom": 121,
+    "left": 236
+  },
+  "commandBar": {
+    "x": 0,
+    "y": 752,
+    "width": 1344,
+    "height": 40,
+    "top": 752,
+    "right": 1344,
+    "bottom": 792,
+    "left": 0
+  },
+  "status": {
+    "x": 0,
+    "y": 792,
+    "width": 1344,
+    "height": 29,
+    "top": 792,
+    "right": 1344,
+    "bottom": 821,
+    "left": 0
+  },
+  "terminal": {
+    "x": 245,
+    "y": 128,
+    "width": 1094,
+    "height": 619,
+    "top": 128,
+    "right": 1339,
+    "bottom": 747,
+    "left": 245
+  },
+  "screen": {
+    "x": 245,
+    "y": 128,
+    "width": 1080,
+    "height": 609,
+    "top": 128,
+    "right": 1325,
+    "bottom": 737,
+    "left": 245
+  },
+  "rows": "120 × 29",
+  "toolbarTotalHeight": 202
+}

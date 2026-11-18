@@ -162,7 +162,12 @@ async function main() {
     const value = (selector, expected, timeout = 8000) => page.waitForFunction(
       ([selector, expected]) => document.querySelector(selector)?.textContent?.includes(expected), [selector, expected], { timeout },
     );
-    const click = text => page.getByRole('button', { name: text, exact: true }).click();
+    const click = async text => {
+      const button = page.getByRole('button', { name: text, exact: true });
+      if (!['重连', '交换窗格', '关闭分屏', 'Serial Break', '定时发送 / 重启测试'].includes(text)) return button.click();
+      await page.locator('#top-more').click();
+      return page.getByRole('menuitem', { name: text, exact: true }).click();
+    };
     const fill = (name, text) => page.locator(`#connect-form [name="${name}"]`).fill(String(text));
     const press = key => page.keyboard.press(key);
     const addGroup = async name => {
@@ -258,7 +263,7 @@ async function main() {
     assert.equal(server.pty[0].term, 'xterm-256color');
     assert(server.pty[0].cols > 70);
     console.log('Initial renderer: ' + await page.locator('#global-renderer').textContent());
-    await click('终端设置');
+    await page.locator('#settings').click();
     await page.locator('#settings-form [name=gpu]').uncheck();
     await click('应用');
     await value('#global-renderer', 'DOM');
@@ -481,7 +486,7 @@ async function main() {
     const [timestampFolder] = await readdir(customRoot);
     const timestampDir = join(customRoot, timestampFolder);
     const sessionLog = join(timestampDir, (await segments(timestampDir))[0]);
-    assert.equal(await surface().locator('.session-logs').getAttribute('title'), timestampDir);
+    assert.equal(await page.locator('.top-tools .session-logs').getAttribute('title'), timestampDir);
     const timestamp = /\[\d{4}_\d{2}_\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] /g;
     const withoutTimes = text => text.replace(timestamp, '<time>');
     await feed('FIRST\r');
@@ -659,14 +664,15 @@ async function main() {
       await addCommand(`测试换行滚动的自定义命令按钮 ${index}`, `echo test ${index}`, 'none');
     }
     await click('保存');
-    await page.waitForFunction(() => {
-      const list = document.querySelector('#command-button-list');
-      return list.scrollHeight > list.clientHeight && new Set(Array.from(list.children, child => child.offsetTop)).size > 1;
-    });
-    const lastCommand = page.locator('#command-button-list button').last();
-    await lastCommand.scrollIntoViewIfNeeded();
-    assert((await page.locator('#command-button-list').evaluate(list => list.scrollTop)) > 0);
-    await lastCommand.click();
+    await page.locator('#command-overflow').waitFor();
+    const ordering = await page.locator('#command-button-list button, #command-overflow-menu button').allTextContents();
+    assert.equal(ordering.length, 17);
+    assert(ordering.at(-1).endsWith('16'));
+    assert.equal(await page.locator('.command-bar').evaluate(el => el.getBoundingClientRect().height), 28);
+    await page.locator('#command-overflow').click();
+    const menuBox = await page.locator('#command-overflow-menu').boundingBox();
+    assert(menuBox.y + menuBox.height <= (await page.locator('.command-bar').boundingBox()).y);
+    await page.locator('#command-overflow-menu button').last().click();
     await suffix(serialBeforeCommands, 'echo board\r\necho test 16');
     await click('管理按钮');
     await page.locator('.command-edit-row').last().getByRole('button', { name: '删除按钮' }).click();
@@ -675,8 +681,8 @@ async function main() {
     await click('保存');
     assert.deepEqual(await page.locator('#command-group option').allTextContents(), ['板卡', 'Linux']);
     await page.locator('#command-group').selectOption({ label: 'Linux' });
-    assert.equal(await page.locator('#command-button-list button').count(), 16);
-    console.log('Grouped command buttons, active-tab routing, line endings, wrap, scroll and deletion OK');
+    assert.equal(await page.locator('#command-button-list button, #command-overflow-menu button').count(), 16);
+    console.log('Grouped command buttons, active-tab routing, line endings, single-line overflow menu and deletion OK');
     await focus();
     await press('Control+c');
     await feed('\r\n# ');
@@ -732,7 +738,7 @@ async function main() {
     await restarted.getByRole('button', { name: '取消', exact: true }).click();
     await recent.filter({ hasText: 'Timestamp fixture' }).click();
     await restarted.waitForFunction(() => document.querySelector('#global-state').textContent === '已连接');
-    const logPath = await restarted.locator('.surface:visible .session-logs').getAttribute('title');
+    const logPath = await restarted.locator('.top-tools .session-logs').getAttribute('title');
     assert(logPath.startsWith(customRoot));
     assert.deepEqual(await restarted.locator('#command-group option').allTextContents(), ['板卡', 'Linux']);
     console.log('Independent connection history and command groups survived restart');

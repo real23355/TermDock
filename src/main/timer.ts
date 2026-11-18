@@ -135,6 +135,11 @@ export class SerialTimer {
   private waitReason = '';
   private workflow?: SerialWorkflow;
   private abort?: AbortController;
+  get busy() { return this.active || this.writing; }
+  get manualPending() {
+    this.tracker.state(performance.now(), this.options?.prompt ?? '');
+    return this.tracker.manualPending;
+  }
 
   constructor(
     private logs: SessionLogs,
@@ -144,6 +149,11 @@ export class SerialTimer {
     private mask: (secret: string) => void,
   ) {
     this.interval = setInterval(() => this.tick(), 100);
+    this.tick();
+  }
+  externalSend() {
+    // Programmatic input invalidates the old shell prompt, without pretending the user typed it.
+    this.tracker.beforeSend();
     this.tick();
   }
 
