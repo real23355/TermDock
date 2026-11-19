@@ -55,7 +55,7 @@ export function startApp(options: { serial?: SerialProvider; dataDirectory?: str
     Menu.setApplicationMenu(null);
 
     for (const [name, run] of Object.entries(controller.requests)) {
-      if (name === 'show-logs') {
+      if (name === 'show-logs' || name === 'adb-open-directory') {
         handle(name, async (...args) => {
           const error = await shell.openPath(await run(...args) as string);
           if (error) throw new Error(error);
@@ -72,6 +72,13 @@ export function startApp(options: { serial?: SerialProvider; dataDirectory?: str
     handle('pick-log-directory', async () => {
       const result = await dialog.showOpenDialog(window!, {
         title: '选择串口日志目录', properties: ['openDirectory', 'createDirectory'],
+      });
+      return result.filePaths[0];
+    });
+    handle('pick-adb-directory', async kind => {
+      const target = z.literal(['tools', 'pull']).parse(kind);
+      const result = await dialog.showOpenDialog(window!, {
+        title: target === 'tools' ? '选择 ADB 工具目录' : '选择 ADB 文件保存目录', properties: ['openDirectory', 'createDirectory'],
       });
       return result.filePaths[0];
     });

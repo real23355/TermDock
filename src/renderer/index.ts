@@ -6,10 +6,12 @@ import { createCommandBar } from './command-bar';
 import { connectWebView } from './webview';
 import { highlightKeywords } from './keyword-highlight';
 import { createSftpBrowser } from './sftp-browser';
-import { quoteDroppedPaths } from './shell-paths';
+import { droppedPathsText } from './shell-paths';
 import { bindWorkflow } from './workflow-editor';
 import { icon, type IconName } from './icons';
 import { createAiPanel, type ReadablePane } from './ai-panel';
+import { bindSavedSecret } from './saved-secret';
+import { bindAdbPanel } from './adb-panel';
 import type { Bridge } from '../desktop-bridge';
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
@@ -57,8 +59,9 @@ type Tab = {
   gpuFailed?: boolean; surface: HTMLElement; tab: HTMLButtonElement; wrapper: HTMLElement; state: ConnectionState; closing?: boolean;
   detail: string; timer?: TimerState; warning?: string; logDir?: string; reconnectProfile?: Profile;
   actions: Partial<Record<TopAction, () => void>>; recording: boolean; recordPending?: boolean;
+  sentSize?: string;
 };
-type TopAction = 'search' | 'logs' | 'record' | 'disconnect' | 'sftp' | 'forward' | 'reconnect' | 'timer' | 'break';
+type TopAction = 'search' | 'logs' | 'record' | 'connection' | 'sftp' | 'forward' | 'timer' | 'break' | 'adb';
 
 const tabs = new Map<string, Tab>();
 const keys: HostKey[] = [];
@@ -106,6 +109,7 @@ function assign(form: HTMLFormElement, values: object) {
 }
 function cleanAuth() {
   credentialQuery++;
+  showSavedSsh(false);
   assign(connectForm, { method: 'password', password: '', passphrase: '', privateKey: '', rememberPassword: false, forgetPassword: false });
 }
 
@@ -145,6 +149,10 @@ function textControl(target: EventTarget | null): TextControl | undefined {
   if (target instanceof HTMLInputElement && ['text', 'search', 'tel', 'url', 'password'].includes(target.type)) return target;
 }
 document.addEventListener('contextmenu', event => {
+  if (event.target instanceof HTMLElement && event.target.closest('[data-secret] output')) {
+    event.preventDefault();
+    return;
+  }
   const input = textControl(event.target);
   if (!input) return;
   const selection = () => input.value.slice(input.selectionStart ?? 0, input.selectionEnd ?? 0);
@@ -168,14 +176,15 @@ document.addEventListener('mouseup', event => {
   if (event.button !== 0) return;
   const start = textSelectionStart;
   textSelectionStart = undefined;
-  if (!start || !(start.target instanceof HTMLElement) || start.target.closest('.terminal-mount,.context-menu,.session-drag-source')) return;
+  if (!start || !(start.target instanceof HTMLElement) || start.target.closest('.terminal-mount,.context-menu,.session-drag-source,[data-secret]')) return;
   if (start.x === event.clientX && start.y === event.clientY && event.detail < 2) return;
   const input = textControl(start.target);
   if (input?.type === 'password') return;
   queueMicrotask(() => {
     const selection = document.getSelection();
     const value = input ? input.value.slice(input.selectionStart ?? 0, input.selectionEnd ?? 0) :
-      (selection?.anchorNode?.parentElement?.closest('.xterm,input[type=password]') ? '' : selection?.toString());
+      ((selection?.anchorNode?.parentElement?.closest('.xterm,input[type=password],[data-secret]') ||
+        selection?.focusNode?.parentElement?.closest('[data-secret]')) ? '' : selection?.toString());
     if (value) safe(api.copy(value));
   });
 }, true);
@@ -391,22 +400,34 @@ function updateForm() {
   find('#password-fields').hidden = field('method').value !== 'password';
 }
 
+function credentialTarget() {
+  const config = profileSchema.safeParse({ kind: 'ssh', name: 'SSH', host: field('host').value,
+    port: Number(field('port').value), username: field('username').value });
+  return config.success && config.data.kind === 'ssh' ? config.data : undefined;
+}
+const showSavedSsh = bindSavedSecret(find('#ssh-saved-secret'), () => {
+  const config = credentialTarget();
+  if (!config) throw new Error('请先填写有效的 SSH 目标');
+  return api.revealSshPassword(config);
+}, error => { find('#credential-status').textContent = message(error); });
+
 async function updateCredential() {
   const tick = ++credentialQuery;
+  showSavedSsh(false);
   field('password').placeholder = '';
   find('#forget-password').hidden = true;
   find('#credential-status').textContent = authTargetChanged ? '连接目标或账号已更改，请确认并重新填写密码；记住密码选项仍保留。' : '';
   if (field('kind').value !== 'ssh' || field('method').value !== 'password') return;
-  const config = profileSchema.safeParse({ kind: 'ssh', name: 'SSH', host: field('host').value,
-    port: Number(field('port').value), username: field('username').value });
-  if (!config.success || config.data.kind !== 'ssh') return;
+  const config = credentialTarget();
+  if (!config) return;
   let saved: boolean;
-  try { saved = await api.credential(config.data); }
+  try { saved = await api.credential(config); }
   catch (error) {
     if (tick === credentialQuery && connectDialog.open) find('#credential-status').textContent = message(error);
     return;
   }
   if (tick !== credentialQuery || !connectDialog.open) return;
+  showSavedSsh(saved);
   find('#forget-password').hidden = !saved;
   field('password').placeholder = saved ? '留空使用已保存的密码' : '';
   find('#credential-status').textContent = saved ? '密码已保存（当前 Windows 用户）。留空使用，输入新密码并勾选记住密码可替换。'
@@ -578,13 +599,37 @@ async function loadTerminalFont(font: Preferences['font']) {
   await bundledFontReady;
 }
 
-const observer = new ResizeObserver(() => {
+let fitFrame = 0;
+let fitAfterLayout: ReturnType<typeof setTimeout>;
+function fitVisible() {
   for (const tab of split ?? (active ? [active] : [])) fitTab(tab);
-});
+  updateFooter();
+}
+function scheduleFit() {
+  if (!fitFrame) fitFrame = requestAnimationFrame(() => { fitFrame = 0; fitVisible(); });
+  clearTimeout(fitAfterLayout);
+  fitAfterLayout = setTimeout(fitVisible, 90);
+}
+const observer = new ResizeObserver(scheduleFit);
+window.addEventListener('resize', scheduleFit);
+
+function terminalSize(tab: Tab) {
+  const screen = find('.xterm-screen', tab.surface);
+  const width = screen?.offsetWidth || undefined;
+  const height = screen?.offsetHeight || undefined;
+  return { cols: tab.term.cols, rows: tab.term.rows, width, height };
+}
 
 function fitTab(tab: Tab) {
-  if (tab.surface.hidden) return;
+  const mount = find('.terminal-mount', tab.surface);
+  if (tab.surface.hidden || !mount.clientWidth || !mount.clientHeight) return;
   tab.fit.fit();
+  const size = terminalSize(tab);
+  const key = `${size.cols}x${size.rows}:${size.width}x${size.height}`;
+  if (key !== tab.sentSize) {
+    tab.sentSize = key;
+    api.resize(tab.id, size);
+  }
   updateFooter();
 }
 
@@ -597,7 +642,7 @@ function enableGpu(tab: Tab) {
     addon.onContextLoss(() => {
       tab.gpuFailed = true;
       disableGpu(tab);
-      updateFooter();
+      scheduleFit();
     });
   } catch {
     tab.gpuFailed = true;
@@ -629,7 +674,8 @@ function renderPanes() {
       observer.observe(mount);
     }
   }
-  for (const tab of shown) { fitTab(tab); enableGpu(tab); }
+  for (const tab of shown) { enableGpu(tab); fitTab(tab); }
+  scheduleFit();
   find('#empty').hidden = !!active;
   find('#tabs-empty').hidden = !!active;
   for (const [id, direction] of [['#split-side', 'side'], ['#split-stack', 'stack']]) {
@@ -638,6 +684,7 @@ function renderPanes() {
     button.setAttribute('aria-pressed', String(surfaces.dataset.split === direction));
   }
   divider.hidden = !split;
+  find('#split-close').hidden = !split;
   divider.setAttribute('aria-orientation', surfaces.dataset.split === 'stack' ? 'horizontal' : 'vertical');
   for (const [index, pane] of shown.entries()) {
     const select = find<HTMLSelectElement>('.pane-select', pane.surface);
@@ -659,7 +706,9 @@ function renderPanes() {
 function focusTab(tab: Tab) {
   if (split && active && !split.includes(tab)) split[split[0] === active ? 0 : 1] = tab;
   if (active && active !== tab) previouslyFocused = active;
+  const changed = active !== tab;
   active = tab;
+  if (changed) aiUI.captureSelection();
   tab.tab.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   renderPanes();
   restoreTerminalFocus();
@@ -679,6 +728,7 @@ function setSplitRatio(ratio: number) {
   splitRatio = Math.max(20, Math.min(80, ratio));
   surfaces.style.setProperty('--split-ratio', splitRatio + '%');
   divider.setAttribute('aria-valuenow', String(Math.round(splitRatio)));
+  scheduleFit();
 }
 divider.setAttribute('aria-valuemin', '20');
 divider.setAttribute('aria-valuemax', '80');
@@ -803,6 +853,7 @@ function bindSurface(tab: Tab) {
     if (event.button === 0 && selecting) {
       setTimeout(() => {
         selecting = false;
+        if (active === tab) aiUI.captureSelection();
         if (tab.term.hasSelection()) safe(api.copy(tab.term.getSelection()));
       }, 0);
     }
@@ -829,10 +880,9 @@ function bindSurface(tab: Tab) {
     event.preventDefault();
     event.stopPropagation();
     if (tab.profile.kind !== 'local' || tab.state !== 'connected') return;
-    const shell = tab.profile.shell;
     focusTab(tab);
     safe(api.droppedPaths(window.termDock ? [] : files).then(paths => {
-      const value = quoteDroppedPaths(shell, paths);
+      const value = droppedPathsText(paths);
       if (tab.state === 'connected' && tabs.has(tab.id)) tab.term.paste(value);
     }));
   };
@@ -895,7 +945,6 @@ function bindSurface(tab: Tab) {
     api.write(tab.id, data);
   });
   tab.term.onBinary(data => { if (tab.state === 'connected') api.write(tab.id, data, true); });
-  tab.term.onResize(size => api.resize(tab.id, size));
   tab.actions.logs = () => safe(api.showLogs(tab.id));
   tab.actions.sftp = () => openSftp(tab.id);
   tab.actions.forward = () => {
@@ -905,8 +954,11 @@ function bindSurface(tab: Tab) {
     forwardDialog.showModal();
     safe(refreshForwards(tab));
   };
-  tab.actions.disconnect = () => safe(api.disconnect(tab.id).then(restoreTerminalFocus));
   tab.actions.break = () => safe(api.serialBreak(tab.id).then(restoreTerminalFocus));
+  tab.actions.adb = () => {
+    tab.term.focus();
+    tab.term.paste('adb ');
+  };
   tab.actions.record = () => {
     tab.recordPending = true;
     updateToolbar();
@@ -916,7 +968,11 @@ function bindSurface(tab: Tab) {
       restoreTerminalFocus();
     }).finally(() => { tab.recordPending = false; updateToolbar(); }));
   };
-  tab.actions.reconnect = () => {
+  tab.actions.connection = () => {
+    if (tab.state === 'connected') {
+      safe(api.disconnect(tab.id).then(restoreTerminalFocus));
+      return;
+    }
     const config = tab.reconnectProfile ?? (tab.profile.kind !== 'local' && tab.profile.id
       ? profiles.find(saved => saved.id === (tab.profile as SavedProfile).id) : undefined) ?? tab.profile;
     if (config.kind === 'local') {
@@ -1012,7 +1068,10 @@ async function openTab(profile: SessionProfile, auth?: Auth, passwordOptions?: P
   bindSurface(tab);
   focusTab(tab);
   try {
-    await api.open({ id, profile, auth, ...passwordOptions, size: { cols: term.cols, rows: term.rows } });
+    await api.open({ id, profile, auth, ...passwordOptions, size: terminalSize(tab) });
+    // The backend can be opening credentials or ADB while the window changes size.
+    api.resize(id, terminalSize(tab));
+    scheduleFit();
     if (passwordOptions?.rememberPassword) showNotice('SSH 密码已保存（Windows 用户保护，已验证可读取）');
   } catch (error) {
     removeTab(tab);
@@ -1076,7 +1135,7 @@ find('#reject-key').onclick = () => decideKey(false);
 find('#accept-key').onclick = () => decideKey(true);
 
 function handleSession(event: SessionEvent) {
-  if (event.type === 'ai-progress') return;
+  if (event.type === 'ai-progress' || event.type === 'ai-model') return;
   if (event.type === 'history') {
     renderRecentConnections(event.recentConnections);
     return;
@@ -1085,6 +1144,10 @@ function handleSession(event: SessionEvent) {
   if (!tab) return;
   if (event.type === 'connection') {
     tab.state = event.state;
+    if (tab.state === 'connected' && !tab.surface.hidden) {
+      tab.sentSize = undefined;
+      scheduleFit();
+    }
     tab.detail = event.detail;
     tab.logDir = event.logDir;
     find('.status-dot', tab.tab).dataset.state = event.state;
@@ -1125,39 +1188,62 @@ function readablePanes(): ReadablePane[] {
     selection: () => tab.term.getSelection(),
   }));
 }
-function showSettings(ai = false) {
+type SettingsTab = 'terminal' | 'ai' | 'adb';
+function showSettings(tab: SettingsTab = 'terminal') {
   assign(find<HTMLFormElement>('#settings-form'), preferences);
   settingsDialog.showModal();
-  selectSettings(ai);
+  selectSettings(tab);
 }
-function selectSettings(ai: boolean) {
-  find('#settings-form').hidden = ai;
-  find('#ai-settings-form').hidden = !ai;
-  find('#settings-terminal-tab').setAttribute('aria-selected', String(!ai));
-  find('#settings-ai-tab').setAttribute('aria-selected', String(ai));
-  if (ai) void aiUI.loadSettings();
+function selectSettings(tab: SettingsTab) {
+  find('#settings-form').hidden = tab !== 'terminal';
+  find('#ai-settings-form').hidden = tab !== 'ai';
+  find('#adb-settings-form').hidden = tab !== 'adb';
+  for (const id of ['terminal', 'ai', 'adb']) find(`#settings-${id}-tab`).setAttribute('aria-selected', String(tab === id));
+  if (tab === 'ai') void aiUI.loadSettings();
+  else aiUI.clearSettings();
+  if (tab === 'adb') void loadAdbSettings();
 }
-const aiUI = createAiPanel(api, readablePanes, () => active?.id, () => showSettings(true), restoreTerminalFocus);
-find('#open-ai-chat').onclick = () => aiUI.open('dialog');
+const aiUI = createAiPanel(api, readablePanes, () => active?.id, () => showSettings('ai'), restoreTerminalFocus);
+const loadAdbSettings = bindAdbPanel(api, message);
+const openAi = find<HTMLButtonElement>('#open-ai-chat');
+openAi.onpointerdown = aiUI.captureSelection;
+openAi.onclick = event => {
+  if (event.detail === 0) aiUI.captureSelection();
+  aiUI.open();
+};
 
 const topMenu = find('#top-menu');
 const topMore = find<HTMLButtonElement>('#top-more');
-let capturedSelection: { pane?: ReadablePane; text: string } = { text: '' };
 const actionLabels: Record<TopAction, string> = {
-  search: '搜索', logs: '日志', record: '停止记录', disconnect: '断开', sftp: 'SFTP', forward: '端口转发', reconnect: '重连', timer: '定时发送 / 重启测试', break: 'Serial Break',
+  search: '搜索', logs: '日志', record: '停止记录', connection: '断开', sftp: 'SFTP', forward: '端口转发',
+  timer: '定时发送 / 重启测试', break: 'Serial Break', adb: 'ADB 命令',
 };
+const connectionActionLabels = { connecting: '连接中', connected: '断开', disconnected: '连接' };
+function isPowerShell(tab?: Tab) {
+  const profile = tab?.profile;
+  return profile?.kind === 'local' && (profile.shell === 'powershell' || profile.shell === 'pwsh');
+}
 function canAct(action: TopAction) {
   const tab = active;
   if (!tab) return false;
   if (action === 'search') return true;
   if (action === 'logs') return !!tab.logDir;
   if (action === 'timer') return tab.profile.kind === 'serial';
-  if (action === 'reconnect') return tab.state === 'disconnected';
+  if (action === 'connection') return tab.state !== 'connecting' && !tab.closing;
+  if (action === 'adb') return tab.state === 'connected' && isPowerShell(tab);
   if (action === 'sftp' || action === 'forward') return tab.state === 'connected' && tab.profile.kind === 'ssh';
   if (action === 'break') return tab.state === 'connected' && tab.profile.kind === 'serial';
   return tab.state === 'connected' && !(action === 'record' && tab.recordPending);
 }
-function actionLabel(action: TopAction) { return action === 'record' && !active?.recording ? '开始记录' : actionLabels[action]; }
+function actionLabel(action: TopAction) {
+  if (action === 'connection' && active) return connectionActionLabels[active.state];
+  return action === 'record' && !active?.recording ? '开始记录' : actionLabels[action];
+}
+function actionIcon(action: TopAction): IconName | undefined {
+  if (action === 'adb') return;
+  if (action === 'connection') return active?.state === 'disconnected' ? 'reconnect' : 'disconnect';
+  return action === 'break' ? 'disconnect' : action;
+}
 function updateToolbar() {
   const address = find('#active-endpoint');
   address.textContent = active ? endpoint(active.profile) : '';
@@ -1169,15 +1255,19 @@ function updateToolbar() {
     button.ariaLabel = actionLabel(action);
     if (button.closest('#top-menu')) find('span', button).textContent = actionLabel(action);
     if (action === 'record') button.setAttribute('aria-pressed', String(!!active?.recording));
+    if (action === 'adb') button.hidden = !isPowerShell(active);
+    if (action === 'connection') {
+      const glyph = actionIcon(action)!;
+      if (button.dataset.icon !== glyph) {
+        button.querySelector('.tool-icon')?.replaceWith(icon(glyph));
+        button.dataset.icon = glyph;
+      }
+    }
   }
 }
 function act(action: TopAction) { if (canAct(action)) active?.actions[action]?.(); }
 function closeTopMenu() { topMenu.hidden = true; topMore.setAttribute('aria-expanded', 'false'); }
-function captureSelection() {
-  const pane = readablePanes().find(pane => pane.id === active?.id);
-  capturedSelection = { pane, text: pane?.selection() ?? '' };
-}
-topMore.onpointerdown = captureSelection;
+topMore.onpointerdown = aiUI.captureSelection;
 function menuItem(label: string, run: () => void, disabled = false, name?: IconName) {
   const button = document.createElement('button');
   button.type = 'button'; button.role = 'menuitem'; button.disabled = disabled;
@@ -1189,9 +1279,9 @@ function menuItem(label: string, run: () => void, disabled = false, name?: IconN
 }
 topMore.onclick = event => {
   if (!topMenu.hidden) { closeTopMenu(); restoreTerminalFocus(); return; }
-  if (event.detail === 0) captureSelection();
+  if (event.detail === 0) aiUI.captureSelection();
   const actions = (Object.keys(actionLabels) as TopAction[]).map(action => {
-    const button = menuItem(actionLabel(action), () => act(action), !canAct(action), action === 'break' ? 'disconnect' : action);
+    const button = menuItem(actionLabel(action), () => act(action), !canAct(action), actionIcon(action));
     button.dataset.action = action;
     return button;
   });
@@ -1204,11 +1294,10 @@ topMore.onclick = event => {
     menuItem('交换窗格', () => { if (split && active) { split.reverse(); focusTab(active); } }, !split, 'forward'),
     menuItem('关闭分屏', closeSplit, !split),
     ...actions,
-    menuItem('AI 对话', () => aiUI.open('dialog'), false, 'ai'),
-    menuItem('AI 日志分析', () => aiUI.open('dock'), false, 'ai'),
-    menuItem('分析选中日志', () => { void aiUI.analyzeSelection(capturedSelection.pane, capturedSelection.text); }, false, 'ai'),
+    menuItem('AI 助手', () => aiUI.open(), false, 'ai'),
     menuItem('设置', () => showSettings()),
   );
+  updateToolbar();
   topMenu.hidden = false; topMore.setAttribute('aria-expanded', 'true');
   topMenu.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
 };
@@ -1249,6 +1338,7 @@ for (const button of document.querySelectorAll<HTMLButtonElement>('button[data-s
 }
 find('#split-side').onclick = () => chooseSplit('side');
 find('#split-stack').onclick = () => chooseSplit('stack');
+find('#split-close').onclick = closeSplit;
 function closeSplit() {
   split = undefined;
   delete surfaces.dataset.split;
@@ -1310,8 +1400,9 @@ renderPanes();
 find('#new-profile').onclick = () => openConnect('serial', 'save');
 find('#all-logs').onclick = () => safe(api.showLogs());
 find('#settings').onclick = () => showSettings();
-find('#settings-terminal-tab').onclick = () => selectSettings(false);
-find('#settings-ai-tab').onclick = () => selectSettings(true);
+find('#settings-terminal-tab').onclick = () => selectSettings('terminal');
+find('#settings-ai-tab').onclick = () => selectSettings('ai');
+find('#settings-adb-tab').onclick = () => selectSettings('adb');
 settingsDialog.addEventListener('close', nextKey);
 find<HTMLFormElement>('#settings-form').onsubmit = event => {
   event.preventDefault();

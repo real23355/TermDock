@@ -8,7 +8,7 @@ import { lineEndings, type AiAction, type AiObservation, type Auth, type Forward
 import { SessionLogs } from './logs';
 import { SecretEchoFilter } from './secret-echo';
 import { LocalPty } from './local-pty';
-import { SerialTimer } from './timer';
+import { isTerminalReport, SerialTimer } from './timer';
 import { listRemote, transferFile } from './sftp';
 import { LocalForward } from './ssh-forward';
 import type { Store } from './store';
@@ -78,6 +78,7 @@ export class Session {
     logRoot: string,
     private emit: (event: SessionEvent) => void,
     private serialProvider: SerialProvider,
+    private adbDirectory?: string,
   ) {
     this.id = request.id;
     this.serialConfig = request.profile.kind === 'serial' ? request.profile : undefined;
@@ -88,6 +89,10 @@ export class Session {
   }
 
   get logDir() { return this.logs?.directory; }
+  get aiSerialTarget() {
+    const config = this.serialConfig;
+    if (config && this.state === 'connected' && this.serial?.isOpen) return { value: this.id, label: `${config.path} · ${config.name}` };
+  }
 
   private async connect(request: OpenRequest, logRoot: string) {
     const serial = request.profile.kind === 'serial' ? request.profile : undefined;
@@ -113,7 +118,7 @@ export class Session {
   }
 
   private async connectLocal(config: LocalProfile) {
-    const terminal = this.local = new LocalPty(this.size, config);
+    const terminal = this.local = new LocalPty(this.size, config, this.adbDirectory);
     terminal.output.on('data', this.receive);
     void terminal.finished.then(result => {
       if (this.state === 'connected') void this.end(result.detail, result.failed);
@@ -278,7 +283,6 @@ export class Session {
     if (!config || this.state !== 'connected' || !port?.isOpen) throw new Error('请选择已连接的串口作为 AI 发送目标');
     if (!this.logs?.healthy) throw new Error('日志不可用，AI 串口操作已停止');
     if (this.timer?.busy) throw new Error('请先停止此串口的定时任务或重启测试');
-    if (this.timer?.manualPending) throw new Error('串口有未结束的手动输入，请先完成或取消该输入');
     if (this.aiOwner || this.aiWritePending || port.writableLength || this.sendingBreak) throw new Error('此串口已有操作正在进行，请稍后重试');
     const owner = this.aiOwner = { runId, cancel };
     this.logs.event('ai_started', `run=${runId}`);
@@ -294,6 +298,9 @@ export class Session {
   private async aiExchange(owner: NonNullable<Session['aiOwner']>, port: SerialDevice, action: AiAction, signal: AbortSignal, written: () => void): Promise<AiObservation> {
     signal.throwIfAborted();
     if (this.aiOwner !== owner || this.state !== 'connected' || !port.isOpen || !this.logs?.healthy) throw new Error('串口或日志不可用，AI 操作已停止');
+    if (action.type === 'send' && this.timer?.manualTyping) {
+      throw new Error(`${this.serialConfig?.path} 有未结束的手动输入。请按 Enter 提交，或用 Ctrl+C 取消后重试。`);
+    }
     const chunks: Buffer[] = [];
     let received = 0;
     let kept = 0;
@@ -326,14 +333,17 @@ export class Session {
       }
       clearTimeout(writeTimeout);
       const started = Date.now();
+      let foundPrompt = false;
       while (Date.now() - started < action.waitMs) {
+        if (action.type === 'waitPrompt' && this.timer?.aiAtPrompt(action.prompt)) { foundPrompt = true; break; }
         await Promise.race([delay(Math.max(1, Math.min(50, action.waitMs - (Date.now() - started)))), abortWait]);
         if (signal.aborted) aborted();
         if (this.state !== 'connected' || !this.logs?.healthy) throw new Error('串口或日志不可用，AI 操作已停止');
-        if (received && Date.now() - started >= 350 && Date.now() - lastReceived >= 350) break;
+        if ((action.type === 'send' || action.type === 'wait') && received && Date.now() - started >= 350 && Date.now() - lastReceived >= 350) break;
       }
+      const timedOut = action.type === 'waitPrompt' && !foundPrompt && !this.timer?.aiAtPrompt(action.prompt);
       const observation = { text: Buffer.concat(chunks).toString('utf8'), bytes: received, truncated: received > kept,
-        written: action.type === 'send', readAt: new Date().toISOString() };
+        written: action.type === 'send', readAt: new Date().toISOString(), ...(timedOut ? { timedOut } : {}) };
       this.logs.event('ai_observed', `run=${owner.runId} bytes=${received} truncated=${observation.truncated}`);
       return observation;
     } finally {
@@ -348,7 +358,7 @@ export class Session {
     const stream = this.serial ?? this.channel ?? this.local?.input;
     if (!stream?.writable) return false;
     // Device replies and mouse/focus reports are not manual typing.
-    if (data && !/^(?:\x1b\[(?:[?><]?[\d;]+[cRnMmu]|\?\d+;\d+\$y|[IO])|\x1b\[M[\s\S]{3})$/.test(data)) this.aiOwner?.cancel('manual');
+    if (data && !isTerminalReport(data)) this.aiOwner?.cancel('manual');
     const bytes = Buffer.from(data, binary ? 'latin1' : 'utf8');
     if (stream.writableLength + bytes.length > inputLimit) {
       if (!this.inputOverflow) this.error('终端发送缓冲区已满，部分输入未发送');
@@ -366,7 +376,7 @@ export class Session {
   resize(size: Size) {
     this.size = size;
     if (this.state === 'connected') {
-      this.channel?.setWindow(size.rows, size.cols, 0, 0);
+      this.channel?.setWindow(size.rows, size.cols, size.height ?? 0, size.width ?? 0);
       this.local?.resize(size);
     }
   }

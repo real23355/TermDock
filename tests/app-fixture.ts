@@ -61,10 +61,32 @@ Object.assign(globalThis, {
 startApp({
   dataDirectory: process.env.TERMDOCK_TEST_DATA,
   aiTransport: {
-    timeoutMs: 500,
+    timeoutMs: 3300,
     fetch: async (url, options) => {
       const body = JSON.parse(String(options?.body));
       aiRequests.push({ url: String(url), authorization: (options?.headers as Record<string, string>).Authorization, body });
+      if (aiMode === 'sse') {
+        const encoder = new TextEncoder();
+        const sse = (delta: object) => 'data: ' + JSON.stringify({ choices: [{ delta }] }) + '\r\n\r\n';
+        const times: ReturnType<typeof setTimeout>[] = [];
+        return new Response(new ReadableStream({
+          start(controller) {
+            function tick(ms: number, text: string) { times.push(setTimeout(() => controller.enqueue(encoder.encode(text)), ms)); }
+            tick(1150, sse({ reasoning_content: 'test reasoning' }));
+            tick(1650, sse({ content: '实时第一段' }));
+            tick(2150, sse({ content: '，实时第二段。' }));
+            times.push(setTimeout(() => { controller.enqueue(encoder.encode('data: [DONE]\n\n')); controller.close(); }, 2300));
+            options?.signal?.addEventListener('abort', () => { times.forEach(clearTimeout); try { controller.error(new Error('test abort')); } catch {} }, { once: true });
+          },
+          cancel() { times.forEach(clearTimeout); },
+        }), { headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      if (aiMode === 'unsupported-effort' && body.reasoning_effort === 'max') {
+        return new Response(JSON.stringify({ error: { param: 'reasoning_effort', message: 'unsupported value' } }), { status: 400 });
+      }
+      if (aiMode === 'unsupported-stream' && body.stream) {
+        return new Response(JSON.stringify({ error: { param: 'stream', message: 'stream is not supported' } }), { status: 400 });
+      }
       if (aiMode === 'plans') {
         const plan = aiPlans.shift() ?? { reply: '已完成本次操作。', action: null };
         return new Response(JSON.stringify({ choices: [{ message: { content: typeof plan === 'string' ? plan : JSON.stringify(plan) } }] }));

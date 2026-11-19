@@ -47,6 +47,7 @@ export const authSchema = z.discriminatedUnion('method', [
 ]);
 export const sizeSchema = z.object({
   cols: z.number().int().min(2).max(1000), rows: z.number().int().min(1).max(500),
+  width: z.number().int().min(1).max(32767).optional(), height: z.number().int().min(1).max(32767).optional(),
 });
 const singleLine = z.string().min(1).max(1024).refine(s => s.trim() && !/[\x00-\x1f\x7f]/.test(s), '请输入单行命令');
 export const timerStep = z.discriminatedUnion('type', [
@@ -108,29 +109,49 @@ export type CommandButton = z.infer<typeof commandButtonSchema>;
 
 export const defaults: Preferences = { font: 'macOS', fontSize: 15, scrollback: 10000, gpu: true };
 export const aiDefaults = { model: 'GLM-5.3-Flash-NVFP4' };
-export const aiSettingsSchema = z.object({ model: z.string().trim().min(1, '请输入模型全名').max(160).regex(/^[^\x00-\x1f\x7f]+$/, '模型名包含无效字符') });
+export const aiPresets = [aiDefaults.model, 'DeepSeek-V4.1-Flash-1017'];
+export const aiModelSchema = z.string().trim().min(1, '请输入模型全名').max(160).regex(/^[^\x00-\x1f\x7f]+$/, '模型名包含无效字符');
+export const aiSettingsSchema = z.object({ model: aiModelSchema, models: aiModelSchema.array().default([]) });
+export const aiEffortSchema = z.literal(['low', 'high', 'max']);
+export type AiEffort = z.infer<typeof aiEffortSchema>;
 export const aiSourceSchema = z.object({
   id: z.string().min(1).max(100), name: z.string().max(400), endpoint: z.string().max(400),
   position: z.string().max(80), readAt: z.iso.datetime(), text: z.string().min(1).max(240000),
 });
 export const aiMessageSchema = z.object({ role: z.literal(['user', 'assistant']), content: z.string().min(1).max(60000) });
-export const aiChatSchema = z.object({ id, sources: aiSourceSchema.array().max(40), messages: aiMessageSchema.array().min(1).max(40) });
+export const aiChatSchema = z.object({ id, sources: aiSourceSchema.array().max(40), messages: aiMessageSchema.array().min(1).max(40), effort: aiEffortSchema.optional() });
+const aiWait = z.number().int().min(250).max(30000);
 export const aiActionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('send'), text: z.string().max(2048).refine(value => !/[\x00-\x1f\x7f]/.test(value), 'AI 只能发送单行文本'),
     lineEnding: z.literal(['CR', 'LF', 'CRLF', 'none']).default('CR'), waitMs: z.number().int().min(250).max(10000).default(1500) }).strict()
     .refine(value => value.text.length > 0 || value.lineEnding !== 'none', '不能发送空内容'),
   z.object({ type: z.literal('wait'), waitMs: z.number().int().min(250).max(10000).default(1500) }).strict(),
+  z.object({ type: z.literal('delay'), waitMs: aiWait }).strict(),
+  z.object({ type: z.literal('waitPrompt'), prompt: z.string().trim().min(1).max(256).regex(/^[^\x00-\x1f\x7f]+$/), waitMs: aiWait }).strict(),
 ]);
-export const aiAssistSchema = aiChatSchema.extend({ serialTargetId: id });
+export const aiAssistSchema = aiChatSchema.extend({ serialTargetId: id.optional() });
 export type AiAction = z.infer<typeof aiActionSchema>;
-export type AiObservation = { text: string; bytes: number; truncated: boolean; written: boolean; readAt: string };
+export type AiObservation = { text: string; bytes: number; truncated: boolean; written: boolean; readAt: string; timedOut?: boolean };
+export type AiChoice = { value: string; label: string };
+export type AiInteraction = { id: string; prompt: string } & (
+  { kind: 'authorize'; target: string; steps: AiAction[] } |
+  { kind: 'question'; answerType: 'confirm' | 'single' | 'multiple' | 'text' | 'serial'; options: AiChoice[] }
+);
+export type AiModelEvent = { id: string; type: 'ai-model'; phase: 'waiting' | 'thinking' | 'reply'; chunk?: string };
 export type AiAssistEvent = { id: string; type: 'ai-progress'; runId: string; step: number;
-  phase: 'planning' | 'sending' | 'written' | 'observed' | 'finished'; detail: string; action?: AiAction; observation?: AiObservation };
+  phase: 'planning' | 'sending' | 'written' | 'observed' | 'finished' | 'waiting-user'; detail: string;
+  action?: AiAction; observation?: AiObservation; interaction?: AiInteraction };
 export type AiAssistResult = { reply: string; steps: number; writes: number; limited: boolean };
-export type AiSettings = z.infer<typeof aiSettingsSchema> & { keySaved: boolean; keyError?: string };
+export type AiSettings = z.infer<typeof aiSettingsSchema> & { keySaved: boolean; keyError?: string; unsupportedEfforts: AiEffort[] };
 export type AiSource = z.infer<typeof aiSourceSchema>;
 export type AiMessage = z.infer<typeof aiMessageSchema>;
 export type AiChat = z.infer<typeof aiChatSchema>;
+export const adbDirectorySchema = z.string().max(32767).regex(/^(?:[a-z]:[\\/]|\\\\(?![?.]\\)[^\\]+\\[^\\]+)/i, '请选择 Windows 绝对路径')
+  .refine(value => !/[\x00-\x1f";]/.test(value), '目录包含无效字符');
+export const adbPreferencesSchema = z.object({ directory: adbDirectorySchema.optional(), pullDirectory: adbDirectorySchema.optional(), systemPath: z.boolean().default(false) });
+export type AdbPreferences = z.infer<typeof adbPreferencesSchema>;
+export type AdbSettings = { directory: string; pullDirectory: string; systemPath: boolean };
+export type AdbDevice = { serial: string; state: string; details: string };
 export const localDefaults: LocalProfile = { kind: 'local', name: 'PowerShell', shell: 'powershell' };
 export const serialDefaults: SerialProfile = {
   kind: 'serial', name: 'PL2303', path: '', baudRate: 921600,
@@ -153,6 +174,7 @@ export type Forward = ForwardOptions & { id: string };
 export type HostKey = { id: string; token: string; host: string; port: number; fingerprint: string };
 export type SessionEvent =
   | AiAssistEvent
+  | AiModelEvent
   | { id: string; type: 'connection'; state: ConnectionState; detail: string; logDir?: string }
   | { id: string; type: 'history'; recentConnections: RecentConnection[] }
   | { id: string; type: 'timer'; state: TimerState }
@@ -169,12 +191,23 @@ export type DesktopApi = {
   deleteProfile(id: string): Promise<void>;
   editRecent(old: RecentConnection, value: Profile): Promise<RecentConnection[]>;
   credential(config: SshProfile, change?: { action: 'save' | 'clear'; password?: string }): Promise<boolean>;
+  revealSshPassword(config: SshProfile): Promise<string>;
   aiSettings(): Promise<AiSettings>;
   saveAiSettings(value: { model: string; key?: string; clear?: boolean }): Promise<AiSettings>;
+  addAiModel(model: string): Promise<AiSettings>;
+  revealAiKey(): Promise<string>;
   testAi(value: { id: string; model: string; key?: string }): Promise<string>;
   aiChat(value: AiChat): Promise<string>;
-  aiAssist(value: AiChat & { serialTargetId: string }): Promise<AiAssistResult>;
+  aiAssist(value: AiChat & { serialTargetId?: string }): Promise<AiAssistResult>;
+  answerAi(id: string, interaction: string, answer: string | string[] | boolean | null): Promise<void>;
   cancelAi(id: string): Promise<void>;
+  adbSettings(): Promise<AdbSettings>;
+  saveAdbSettings(value: AdbSettings): Promise<AdbSettings>;
+  pickAdbDirectory(kind: 'tools' | 'pull'): Promise<string | undefined>;
+  openAdbDirectory(): Promise<void>;
+  detectAdb(): Promise<{ executable: string; version: string; systemExecutable?: string }>;
+  adbDevices(): Promise<AdbDevice[]>;
+  pullAdbFile(value: { serial: string; remote: string; directory: string }): Promise<string>;
   savePreferences(value: Preferences): Promise<Preferences>;
   saveCommandGroups(groups: CommandGroup[]): Promise<CommandGroup[]>;
   runCommand(id: string, groupId: string, buttonId: string): Promise<void>;

@@ -60,14 +60,16 @@
         <div class="top-tools" role="toolbar" aria-label="当前窗格工具">
           <button id="split-side" data-icon="side" type="button" aria-pressed="false" title="左右分屏" aria-label="左右分屏"></button>
           <button id="split-stack" data-icon="stack" type="button" aria-pressed="false" title="上下分屏" aria-label="上下分屏"></button>
+          <button id="split-close" type="button" title="取消分屏" aria-label="取消分屏" hidden>×</button>
           <span class="tool-separator"></span>
           <button class="search-toggle" data-action="search" data-icon="search" title="搜索 (Ctrl+Shift+F)" aria-label="搜索"></button>
           <button class="session-logs" data-action="logs" data-icon="logs" title="日志" aria-label="日志" disabled></button>
           <button class="record-log top-secondary" data-action="record" data-icon="record" title="停止记录" aria-label="停止记录" aria-pressed="true" disabled></button>
-          <button class="disconnect top-secondary" data-action="disconnect" data-icon="disconnect" title="断开" aria-label="断开" disabled></button>
+          <button id="session-connection" type="button" data-action="connection" data-icon="disconnect" title="断开" aria-label="断开" disabled></button>
           <button class="open-sftp top-secondary" data-action="sftp" data-icon="sftp" title="SFTP" aria-label="SFTP" disabled></button>
           <button class="open-forward top-secondary" data-action="forward" data-icon="forward" title="端口转发" aria-label="端口转发" disabled></button>
-          <button id="open-ai-chat" data-icon="ai" type="button" title="AI 对话" aria-label="AI 对话"></button>
+          <button id="adb-command" type="button" data-action="adb" title="插入 ADB 命令" aria-label="ADB 命令" hidden disabled>ADB</button>
+          <button id="open-ai-chat" data-icon="ai" type="button" title="AI 助手" aria-label="AI 助手"></button>
           <button id="top-more" type="button" aria-haspopup="menu" aria-expanded="false">更多 ▾</button>
         </div>
         <div id="top-menu" class="toolbar-menu" role="menu" hidden></div>
@@ -86,10 +88,16 @@
       </div>
       <div id="surfaces"></div>
       </div>
+      <div id="ai-dock-divider" role="separator" aria-label="调整 AI 对话栏宽度" aria-orientation="vertical" tabindex="0" hidden></div>
       <aside id="ai-panel" aria-label="AI 对话" hidden>
         <div class="ai-heading"><h2>AI 对话</h2><span class="status-spacer"></span><button id="ai-new-chat" title="开始新对话">新对话</button><button id="ai-popout" title="弹出对话框">弹出</button><button id="ai-collapse" title="收起 AI 栏" aria-label="收起 AI 栏">×</button></div>
+        <div class="ai-config-summary">
+          <span id="ai-current-model" class="ai-model-label"></span>
+          <span id="ai-current-key-status" role="status"></span>
+          <span id="ai-panel-key-secret" class="saved-secret" data-secret hidden><output aria-label="对话栏已保存的 API Key"></output><button type="button">显示</button></span>
+        </div>
         <div class="ai-source-section"><div class="ai-source-heading"><span>读取范围 · SSH / 串口</span><button id="ai-configure">设置</button></div>
-          <div id="ai-sources"></div><div class="ai-source-actions"><small>发送问题时自动读取所选画面</small><button id="ai-read">读取并分析</button></div>
+          <div id="ai-sources"></div><div class="ai-source-actions"><small>发送问题时自动读取所选画面</small><button id="ai-read">读取并分析</button><button id="ai-read-selection" type="button" hidden>分析选区</button></div>
         </div>
         <div class="ai-operation-controls"><label>操作模式<select id="ai-mode"><option value="chat">仅对话</option><option value="serial">自动操作串口</option></select></label>
           <label id="ai-target-row" hidden>发送目标<select id="ai-serial-target" aria-label="AI 串口发送目标"><option value="">选择已连接串口</option></select></label>
@@ -99,8 +107,10 @@
         <button id="ai-use-screen" type="button" hidden>改用所选终端当前画面</button>
         <div id="ai-messages" role="log" aria-label="AI 对话"></div>
         <p id="ai-status" role="status"></p>
+        <div id="ai-progress" hidden><span class="ai-spinner" aria-hidden="true"></span><span id="ai-phase" role="status"></span><time id="ai-elapsed"></time></div>
+        <section id="ai-interaction" aria-label="等待你的回答" hidden></section>
         <form id="ai-chat-form"><textarea id="ai-question" rows="3" maxlength="60000" aria-label="向 AI 提问" placeholder="直接提问，例如：这段报错是什么原因？帮我在串口查看内存。"></textarea>
-          <div class="ai-chat-actions"><button id="ai-cancel" type="button" hidden>停止</button><span class="status-spacer"></span><button id="ai-send" type="submit">发送</button></div>
+          <div class="ai-chat-actions"><label class="ai-effort-label">思考<select id="ai-effort"><option value="">跟随默认</option><option value="low">快速</option><option value="high">标准</option><option value="max">深度</option></select></label><button id="ai-cancel" type="button" hidden>停止</button><button id="ai-retry" type="button" hidden>重试</button><span class="status-spacer"></span><button id="ai-send" type="submit">发送</button></div>
         </form>
       </aside></div>
     </section>
@@ -165,6 +175,7 @@
             <label>认证方式<select name="method"><option value="password">密码</option><option value="key">私钥</option><option value="agent">SSH Agent</option></select></label>
             <div id="password-fields">
               <label>密码<input name="password" type="password" autocomplete="new-password"></label>
+              <div id="ssh-saved-secret" class="saved-secret" data-secret hidden><output aria-label="已保存的 SSH 密码"></output><button type="button">显示</button></div>
               <label class="check"><input type="checkbox" name="rememberPassword">记住密码（仅此 Windows 用户）</label>
               <label class="check" id="forget-password" hidden><input type="checkbox" name="forgetPassword">清除这个目标的已保存密码</label>
               <small id="credential-status" role="status"></small>
@@ -249,7 +260,7 @@
   </dialog>
   <dialog id="settings-dialog">
     <div class="dialog-head"><h2>设置</h2><button type="button" data-dismiss aria-label="关闭">×</button></div>
-    <div class="settings-tabs" role="tablist" aria-label="设置分类"><button id="settings-terminal-tab" role="tab" aria-selected="true">终端</button><button id="settings-ai-tab" role="tab" aria-selected="false">AI</button></div>
+    <div class="settings-tabs" role="tablist" aria-label="设置分类"><button id="settings-terminal-tab" role="tab" aria-selected="true">终端</button><button id="settings-ai-tab" role="tab" aria-selected="false">AI</button><button id="settings-adb-tab" role="tab" aria-selected="false">ADB</button></div>
     <form id="settings-form">
       <div class="dialog-body form-grid">
         <label>字体<select name="font"><option value="macOS">macOS 风格</option><option>Cascadia Mono</option><option>Consolas</option><option>Lucida Console</option><option>monospace</option></select></label>
@@ -261,13 +272,21 @@
     </form>
     <form id="ai-settings-form" hidden>
       <div class="dialog-body ai-settings-fields">
-        <label>API Key<input id="ai-key" type="password" autocomplete="off" maxlength="8192" placeholder="留空沿用已保存的 Key"></label>
+        <label>API Key<input id="ai-key" data-secret type="password" autocomplete="off" maxlength="8192" placeholder="留空沿用已保存的 Key"></label>
+        <div id="ai-settings-key-secret" class="saved-secret" data-secret hidden><output aria-label="设置中已保存的 API Key"></output><button type="button">显示</button></div>
         <small id="ai-key-status" role="status"></small>
-        <label>模型全名<input id="ai-model" list="ai-models" required maxlength="160" spellcheck="false" value="GLM-5.3-Flash-NVFP4"></label>
-        <datalist id="ai-models"><option value="GLM-5.3-Flash-NVFP4"></option><option value="DeepSeek-V4.1-Flash-1017"></option></datalist>
+        <label>模型全名<span class="input-group"><select id="ai-model" required><option>GLM-5.3-Flash-NVFP4</option><option>DeepSeek-V4.1-Flash-1017</option></select><button id="ai-model-add" type="button">新增模型</button></span></label>
+        <label id="ai-model-new-row" hidden>完整模型名<span class="input-group"><input id="ai-model-new" maxlength="160" spellcheck="false"><button id="ai-model-confirm" type="button">添加并选择</button></span></label>
         <p id="ai-settings-status" role="status"></p>
       </div>
       <div class="dialog-actions"><button id="ai-clear-key" type="button" class="danger">清除 API Key</button><span class="status-spacer"></span><button id="ai-test" type="button">测试连接</button><button id="ai-save" type="submit" class="primary">保存</button></div>
+    </form>
+    <form id="adb-settings-form" hidden>
+      <div class="dialog-body">
+        <label>ADB 工具目录<span class="input-group"><input id="adb-directory" readonly><button id="adb-pick-tools" type="button">选择目录</button></span></label>
+        <p id="adb-status" class="adb-status" role="status"></p>
+      </div>
+      <div class="dialog-actions"><button id="adb-save" type="submit" class="primary">保存</button></div>
     </form>
   </dialog>
 

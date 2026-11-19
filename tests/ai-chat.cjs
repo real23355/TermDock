@@ -35,6 +35,9 @@ async function main() {
     const requests = () => fixture('aiRequests');
     const sent = path => electron.evaluate((_e, path) => Buffer.from(globalThis.fixture.sentPort(path)).toString(), path);
     const send = async text => { await page.locator('#ai-question').fill(text); await page.locator('#ai-send').click(); };
+    const question = page.locator('#ai-question');
+    const card = page.locator('#ai-interaction');
+    const allow = () => card.getByRole('button', { name: '允许本次' }).click();
     await page.locator('#open-ai-chat').click();
     assert(await page.locator('#ai-dialog').evaluate(el => el.open && !el.matches(':modal')));
     const dialogBefore = await page.locator('#ai-dialog').boundingBox();
@@ -44,9 +47,32 @@ async function main() {
     assert((await page.locator('#ai-dialog').boundingBox()).x > dialogBefore.x + 20);
     await page.locator('#ai-configure').click(); await state('#ai-key-status', '尚未保存');
     await page.locator('#ai-key').fill('fixture-chat-key'); await page.locator('#ai-save').click(); await state('#ai-settings-status', '配置已保存');
+    const settingsSecret = page.locator('#ai-settings-key-secret');
+    await settingsSecret.getByRole('button', { name: '显示' }).click();
+    await state('#ai-settings-key-secret output', 'fixture-chat-key');
+    await page.locator('#ai-model-add').click(); await page.locator('#ai-model-new').fill('  Custom-Model-V4  ');
+    await page.locator('#ai-model-confirm').click(); await state('#ai-settings-status', '模型已保存并选中');
+    assert.equal(await page.locator('#ai-model').inputValue(), 'Custom-Model-V4');
+    await page.locator('#ai-model-add').click(); await page.locator('#ai-model-new').fill('Custom-Model-V4');
+    await page.locator('#ai-model-confirm').click(); await state('#ai-settings-status', '模型已保存并选中');
+    assert.equal(await page.locator('#ai-model option[value="Custom-Model-V4"]').count(), 1);
     await page.locator('#settings-dialog [data-dismiss]').first().click();
-    await send('我可以直接问 Linux 问题吗？'); await until(async () => (await page.locator('.ai-assistant').count()) === 1, 'direct general chat');
-    assert.equal((await requests()).at(-1).body.messages.at(-1).content, '我可以直接问 Linux 问题吗？');
+    await state('#ai-current-model', 'Custom-Model-V4');
+    assert.equal(await page.locator('#ai-panel-key-secret output').textContent(), '••••••••');
+    await page.locator('#ai-panel-key-secret button').click(); await state('#ai-panel-key-secret output', 'fixture-chat-key');
+    await page.locator('#ai-panel-key-secret button').click();
+    await question.fill('我可以直接问 Linux 问题吗？');
+    await question.press('End'); await question.press('Alt+Enter'); await question.pressSequentially('second line');
+    assert.equal(await question.inputValue(), '我可以直接问 Linux 问题吗？\nsecond line');
+    await question.evaluate(el => {
+      el.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+      el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true }));
+      el.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '中' }));
+    });
+    assert.equal((await requests()).length, 0);
+    await question.press('Enter'); await until(async () => (await page.locator('.ai-assistant').count()) === 1, 'direct general chat');
+    assert.equal((await requests()).at(-1).body.messages.at(-1).content, '我可以直接问 Linux 问题吗？\nsecond line');
+    assert.equal((await requests()).at(-1).body.model, 'Custom-Model-V4');
     assert((await requests()).at(-1).body.messages[0].content.includes('不要把每个问题都套成日志报告'));
     await page.locator('#ai-collapse').click();
     await page.locator('#quick-ssh').click();
@@ -80,6 +106,44 @@ async function main() {
     assert(!body.includes('SSH_UPDATED_WITHOUT_MANUAL_READ'));
     assert(!(await requests()).at(-1).body.messages.some(m => m.role === 'assistant'));
 
+    const thinking = page.locator('#ai-effort');
+    for (const level of ['', 'low', 'high', 'max']) {
+      await thinking.selectOption(level);
+      await send('验证思考挡位 ' + (level || 'default'));
+      await page.locator('#ai-send:enabled').waitFor();
+      assert.equal((await requests()).at(-1).body.reasoning_effort, level || undefined);
+    }
+    await fixture('aiMode', 'unsupported-effort');
+    await send('保留此消息以便重试'); await state('#ai-status', '不支持所选思考挡位');
+    await page.waitForFunction(() => document.querySelector('#ai-effort option[value=max]').disabled);
+    assert.equal(await question.inputValue(), '保留此消息以便重试');
+    await thinking.selectOption('low');
+    await fixture('aiMode', 'unsupported-stream');
+    const fallbackBefore = (await requests()).length;
+    await page.locator('#ai-retry').click(); await page.locator('#ai-send:enabled').waitFor();
+    assert.deepEqual((await requests()).slice(fallbackBefore).map(request => request.body.stream), [true, undefined]);
+    await fixture('aiMode', 'sse');
+    await send('验证实时回复'); await state('#ai-phase', '等待模型响应');
+    await state('#ai-elapsed', '0:01'); await state('#ai-phase', '模型思考中');
+    await state('#ai-phase', '生成回复中'); await state('.ai-assistant:last-child > div', '实时第一段');
+    await page.locator('#ai-send:enabled').waitFor();
+    assert.equal(await page.locator('.ai-assistant').last().locator('div').textContent(), '实时第一段，实时第二段。');
+    assert(await page.locator('#ai-progress').isHidden());
+    await fixture('aiMode', 'ok');
+
+    // Hold half a command while the serial port sends data. A read-only question must still complete.
+    await page.locator('#tab-' + serialIds[0]).click();
+    await page.locator('#surface-' + serialIds[0] + ' .xterm-helper-textarea').focus(); await page.keyboard.type('half');
+    const busyFeeder = setInterval(() => electron.evaluate(() => globalThis.fixture.feedPort('COM3', [...Buffer.from('BUSY_OUTPUT\r\n')])).catch(() => {}), 40);
+    try { await send('持续输出期间的只读问题'); await page.locator('#ai-send:enabled').waitFor(); }
+    finally { clearInterval(busyFeeder); }
+    assert.equal(await sent('COM3'), 'half');
+    await page.locator('#ai-mode').selectOption('serial'); await page.locator('#ai-serial-target').selectOption(serialIds[0]);
+    await fixture('aiPlans', [{ reply: '手动输入冲突', action: { type: 'send', text: 'MUST_NOT_WRITE', lineEnding: 'CR', waitMs: 250 } }]);
+    await send('尝试发送到串口'); await allow(); await state('#ai-status', 'COM3 有未结束的手动输入');
+    assert.equal(await sent('COM3'), 'half');
+    await page.locator('#surface-' + serialIds[0] + ' .xterm-helper-textarea').focus(); await page.keyboard.press('Control+c');
+
     await page.locator('#ai-mode').selectOption('serial'); await page.locator('#ai-serial-target').selectOption(serialIds[0]);
     await fixture('aiPlans', [
       { reply: '查看内存', action: { type: 'send', text: 'free -m', lineEnding: 'CR', waitMs: 1000 } },
@@ -89,15 +153,19 @@ async function main() {
     await electron.evaluate(() => globalThis.fixture.serialReplies('COM3', [['free -m\r', 'MEMORY_RESULT_1024\r\n# '], ['uname -a\n', 'KERNEL_RESULT_LINUX\r\n# ']]));
     const before = (await requests()).length;
     await send('帮我检查这块板卡的内存和系统，直接操作 COM3');
-    await page.locator('#ai-cancel').waitFor();
+    await card.getByRole('button', { name: '允许本次' }).waitFor();
+    assert.equal(await sent('COM3'), 'half\x03');
     assert(await page.locator('#ai-mode').isDisabled()); assert(await page.locator('#ai-serial-target').isDisabled());
+    await page.locator('#tab-' + serialIds[1]).click();
     await page.locator('#surface-' + serialIds[1] + ' .xterm-helper-textarea').focus(); await page.keyboard.type('OTHER');
+    await allow(); await allow();
     await state('#ai-status', '本轮结束：2 次实际写入');
-    assert.equal(await sent('COM3'), 'free -m\runame -a\n'); assert.equal(await sent('COM12'), 'OTHER');
+    assert.equal(await sent('COM3'), 'half\x03free -m\runame -a\n'); assert.equal(await sent('COM12'), 'OTHER');
     const autoRequests = (await requests()).slice(before);
     assert.equal(autoRequests.length, 3);
     assert(JSON.stringify(autoRequests[1].body.messages).includes('MEMORY_RESULT_1024'));
     assert(JSON.stringify(autoRequests[2].body.messages).includes('KERNEL_RESULT_LINUX'));
+    assert(autoRequests.every(request => request.body.reasoning_effort === 'low'));
     assert((await page.locator('.ai-action').allTextContents()).some(t => t.includes('串口已确认写入')));
     await page.screenshot({ path: join(directory, 'dialog-verified.png') });
     const count = await page.locator('.ai-message').count(); await page.locator('#ai-popout').click();
@@ -105,27 +173,55 @@ async function main() {
     assert.equal(await page.locator('.ai-message').count(), count);
     await page.locator('#ai-popout').click(); assert(await page.locator('#ai-dialog').evaluate(el => el.open));
 
+    for (const choice of ['不允许', '关闭确认窗口']) {
+      const baseline = await sent('COM3');
+      await fixture('aiPlans', [{ reply: '是否授权本轮写入 COM3？', action: { type: 'send', text: 'MUST_NOT_SEND', lineEnding: 'CR', waitMs: 250 } }]);
+      await send('验证拒绝及关闭');
+      await card.getByRole('button', { name: choice, exact: true }).click();
+      await state('.ai-assistant:last-child > div', '写入未获允许');
+      assert.equal(await sent('COM3'), baseline);
+    }
+    await page.locator('#ai-serial-target').selectOption('');
+    await fixture('aiPlans', [
+      { reply: '', action: { type: 'ask', prompt: '请选择实际串口', answerType: 'serial' } },
+      { reply: '', action: { type: 'ask', prompt: '设备提示符是什么？', answerType: 'text' } },
+      { reply: '', action: { type: 'ask', prompt: '选择要看的信息', answerType: 'multiple', options: ['内存', '内核', '版本'] } },
+      { reply: '', action: { type: 'ask', prompt: '现在结束本轮吗？', answerType: 'confirm' } },
+      { reply: '已收到填写的条件', action: null },
+    ]);
+    await send('按需询问我需要的信息');
+    await card.getByRole('radio', { name: /COM3/ }).check(); await card.getByRole('button', { name: '提交回答' }).click();
+    await card.getByRole('textbox').fill('~ #'); await card.getByRole('button', { name: '提交回答' }).click();
+    await card.getByRole('checkbox', { name: '内存' }).check(); await card.getByRole('checkbox', { name: '版本' }).check();
+    await card.getByRole('button', { name: '提交回答' }).click();
+    await card.getByRole('button', { name: '是', exact: true }).click(); await state('.ai-assistant:last-child > div', '已收到填写的条件');
+    const replies = JSON.stringify((await requests()).at(-1).body.messages.filter(item => item.role === 'user'));
+    assert(replies.includes('收到用户回答') && replies.includes('~ #') && replies.includes('内存') && replies.includes('版本'));
+    await page.locator('#ai-serial-target').selectOption(serialIds[0]);
+
     await fixture('aiPlans', [{ reply: '等待', action: { type: 'wait', waitMs: 10000 } }, { reply: '不应发送', action: { type: 'send', text: 'MUST_NOT_SEND', lineEnding: 'CR', waitMs: 250 } }]);
     await send('等一下串口输出'); await page.locator('#ai-cancel').waitFor(); await state('#ai-status', '等待');
     await page.locator('#ai-cancel').click(); await state('#ai-status', '已取消'); await sleep(100);
     assert(!(await sent('COM3')).includes('MUST_NOT_SEND'));
     await fixture('aiPlans', [{ reply: '等待关闭窗口测试', action: { type: 'wait', waitMs: 10000 } }]);
-    await send('观察后续输出'); await state('#ai-status', '等待关闭窗口');
+    await send('观察后续输出'); await state('#ai-status', '等待串口新输出');
     await page.locator('#ai-collapse').click(); await page.locator('#open-ai-chat').click(); await state('#ai-status', '已取消');
     await fixture('aiPlans', [{ reply: '等待手动接管测试', action: { type: 'wait', waitMs: 10000 } }]);
-    await send('继续观察'); await state('#ai-status', '等待手动接管');
+    await send('继续观察'); await state('#ai-status', '等待串口新输出');
     await page.locator('#tab-' + serialIds[0]).click(); await page.locator('#surface-' + serialIds[0] + ' .xterm-helper-textarea').focus(); await page.keyboard.type('x');
     await state('#ai-status', '手动输入已停止');
-    await send('再继续'); await state('#ai-status', '未结束的手动输入');
+    await fixture('aiPlans', [{ reply: '尝试发送', action: { type: 'send', text: 'MUST_NOT_SEND', lineEnding: 'CR', waitMs: 250 } }]);
+    await send('再继续'); await allow(); await state('#ai-status', '未结束的手动输入');
     await page.locator('#surface-' + serialIds[0] + ' .xterm-helper-textarea').focus(); await page.keyboard.press('Control+c');
     await electron.evaluate(() => globalThis.fixture.feedPort('COM3', [...Buffer.from('\r\n# ')])); await sleep(450);
     await fixture('aiPlans', [{ reply: '等待断线测试', action: { type: 'wait', waitMs: 10000 } }]);
-    await send('继续等'); await state('#ai-status', '等待断线'); await fixture('disconnectPort', 'COM3'); await state('#ai-status', '串口已断开');
+    await send('继续等'); await state('#ai-status', '等待串口新输出'); await fixture('disconnectPort', 'COM3'); await state('#ai-status', '串口已断开');
     assert.equal(await page.locator('#ai-serial-target').inputValue(), serialIds[0]);
     await send('断线后继续'); await state('#ai-status', '选择已连接');
     assert.equal(await sent('COM12'), 'OTHER');
     await page.locator('#ai-new-chat').click();
     assert.equal(await page.locator('#ai-mode').inputValue(), 'chat');
+    assert.equal(await thinking.inputValue(), '');
     assert.equal(await page.locator('.ai-message').count(), 0);
     assert.deepEqual(errors, []);
     console.log('AI popup/dock, direct questions, live SSH/serial context, automatic serial write/read loop, fixed target across focus changes, stop, manual takeover, pending input and disconnect guards OK. Evidence: ' + directory);

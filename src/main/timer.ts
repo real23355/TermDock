@@ -41,9 +41,9 @@ class PromptTracker {
 
   input(data: string) {
     // Ignore terminal-generated device replies and mouse reports.
-    if (/^(?:\x1b\[(?:[?><]?[\d;]+[cRnMmu]|\?\d+;\d+\$y)|\x1b\[M[\s\S]{3})$/.test(data)) return false;
+    if (isTerminalReport(data)) return false;
     const bracketedPaste = data.includes('\x1b[200~');
-    this.manual = !bracketedPaste && /[\r\n\x03\x04]$/.test(data) ? 'submitted' : 'typing';
+    this.manual = !bracketedPaste && /[\r\n\x03\x04\x15]$/.test(data) ? 'submitted' : 'typing';
     this.resetLine();
     return true;
   }
@@ -114,6 +114,15 @@ class PromptTracker {
   }
 
   get manualPending() { return this.manual !== 'idle'; }
+  get manualTyping() { return this.manual === 'typing'; }
+  atPrompt(prompt: string) {
+    return this.manual !== 'typing' && this.mode === 'text' && !this.overflow &&
+      performance.now() - this.lastOutput >= settleMs && this.line.trimEnd().endsWith(prompt);
+  }
+}
+
+export function isTerminalReport(data: string) {
+  return /^(?:\x1b\[(?:[?><]?[\d;]+[cRnMmu]|\?\d+;\d+\$y|[IO])|\x1b\[M[\s\S]{3})$/.test(data);
 }
 
 export class SerialTimer {
@@ -136,10 +145,8 @@ export class SerialTimer {
   private workflow?: SerialWorkflow;
   private abort?: AbortController;
   get busy() { return this.active || this.writing; }
-  get manualPending() {
-    this.tracker.state(performance.now(), this.options?.prompt ?? '');
-    return this.tracker.manualPending;
-  }
+  aiAtPrompt(prompt: string) { return this.tracker.atPrompt(prompt); }
+  get manualTyping() { return this.tracker.manualTyping; }
 
   constructor(
     private logs: SessionLogs,

@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { isAbsolute } from 'node:path';
 import type { LocalProfile, Size } from '../shared';
+import { prependPath } from './adb';
 
 const inputFrame = 1;
 const resizeFrame = 2;
@@ -20,7 +21,7 @@ export class LocalPty {
   readonly ready: Promise<void>;
   readonly finished: Promise<{ detail: string; failed: boolean }>;
 
-  constructor(size: Size, config: LocalProfile) {
+  constructor(size: Size, config: LocalProfile, adbDirectory?: string) {
     if (config.cwd && !isAbsolute(config.cwd)) throw new Error('工作目录必须是绝对路径');
     const env = { ...process.env };
     for (const [name, value] of Object.entries(config.env ?? {})) {
@@ -29,7 +30,7 @@ export class LocalPty {
     }
     const child = this.child = spawn(join(__dirname, 'termdock-pty.exe'),
       [String(size.cols), String(size.rows), config.shell, config.cwd || '', String(Object.keys(config.env ?? {})
-        .some(key => key.toUpperCase() === 'PSMODULEPATH'))], { windowsHide: true, env });
+        .some(key => key.toUpperCase() === 'PSMODULEPATH'))], { windowsHide: true, env: adbDirectory ? prependPath(env, adbDirectory) : env });
     let diagnostic = '';
     let started = false;
     const stderr = createInterface({ input: child.stderr });

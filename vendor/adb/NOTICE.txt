@@ -1,0 +1,13 @@
+Android SDK Platform-Tools for Windows
+ADB 1.0.41, version 29.0.5-5949299
+
+adb.exe, AdbWinApi.dll and AdbWinUsbApi.dll were copied byte-for-byte
+from adb1.0.41/ in the user-supplied adb1.0.41.zip.
+Archive SHA-256: 32d100ef6bf6137d15d30204d108278874a3373ca035ccda60dc0359af76a3e2
+
+The three files also match the Windows Platform-Tools 29.0.5 archive.
+Its original notice is included as UPSTREAM-NOTICE.txt.
+Archive: https://dl.google.com/android/repository/platform-tools_r29.0.5-windows.zip
+
+Android Debug Bridge: https://developer.android.com/tools/adb
+Android Open Source Project: https://android.googlesource.com/platform/system/core/

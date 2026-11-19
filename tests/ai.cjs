@@ -53,7 +53,11 @@ async function main() {
     const mode = value => electron.evaluate((_e, value) => globalThis.fixture.aiMode(value), value);
     const closeSettings = () => page.locator('#settings-dialog [data-dismiss]').first().click();
     await configure();
-    assert.equal(await page.locator('#ai-model').inputValue(), 'GLM-5.3-Flash-NVFP4');
+    const model = page.locator('select#ai-model');
+    assert.deepEqual(await model.locator('option').evaluateAll(options => options.map(option => option.value)), [
+      'GLM-5.3-Flash-NVFP4', 'DeepSeek-V4.1-Flash-1017',
+    ]);
+    assert.equal(await model.inputValue(), 'GLM-5.3-Flash-NVFP4');
     assert.equal(await page.locator('#ai-key').getAttribute('type'), 'password');
     await page.locator('#ai-key').fill('fixture-ai-old');
     await save();
@@ -64,11 +68,12 @@ async function main() {
     assert.equal(sent.url, 'https://llm.amlogic.com/v1/chat/completions');
     assert.equal(sent.authorization, 'Bearer fixture-ai-old');
     assert.deepEqual(sent.body, { model: 'GLM-5.3-Flash-NVFP4', messages: [{ role: 'user', content: 'Reply with OK only.' }], max_tokens: 500 });
-    await page.locator('#ai-model').fill('DeepSeek-V4.1-Flash-1017'); await save(); await test();
+    await model.selectOption('DeepSeek-V4.1-Flash-1017'); await save(); await test();
     await state('#ai-settings-status', '调用成功：OK');
     assert.equal((await requests()).at(-1).body.model, 'DeepSeek-V4.1-Flash-1017');
     assert.equal((await requests()).at(-1).authorization, 'Bearer fixture-ai-old');
-    await page.locator('#ai-model').fill('custom-exact-model.20261118');
+    await page.locator('#ai-model-add').click(); await page.locator('#ai-model-new').fill('custom-exact-model.20261118');
+    await page.locator('#ai-model-confirm').click(); await state('#ai-settings-status', '模型已保存并选中');
     await page.locator('#ai-key').fill('fixture-ai-new'); await save(); await test();
     await state('#ai-settings-status', '调用成功：OK');
     assert.equal((await requests()).at(-1).authorization, 'Bearer fixture-ai-new');
@@ -113,7 +118,9 @@ async function main() {
     await electron.evaluate(() => globalThis.fixture.feed([...Buffer.from('SERIAL_ONLY U-Boot BOOT_FAILED\r\n# ')]));
     const serialTab = page.getByRole('tab', { name: 'PL2303', exact: true });
     const serialId = (await serialTab.getAttribute('id')).slice(4);
-    await more('AI 日志分析');
+    await more('AI 助手');
+    assert(await page.locator('#ai-dialog').evaluate(el => el.open && !el.matches(':modal')));
+    await page.locator('#ai-popout').click();
     assert.equal(await page.locator('#ai-sources input:checked').count(), 1);
     assert.equal(await page.locator('#ai-sources input:checked').getAttribute('data-source-id'), serialId);
     await page.locator('#ai-collapse').click();
@@ -123,7 +130,7 @@ async function main() {
     await page.locator('#split-first').selectOption({ label: await page.locator('#split-first option').filter({ hasText: 'AI SSH 0' }).textContent() });
     await page.locator('#split-second').selectOption(serialId);
     await button('应用分屏');
-    await more('AI 日志分析');
+    await more('AI 助手');
     assert.equal(await page.locator('#ai-sources input').count(), 3);
     const ssh0 = page.getByRole('tab', { name: 'AI SSH 0', exact: true });
     const ssh0Id = (await ssh0.getAttribute('id')).slice(4);
@@ -174,13 +181,17 @@ async function main() {
     await page.locator(`#ai-sources input[data-source-id="${ssh0Id}"]`).uncheck();
     await page.locator(`#ai-sources input[data-source-id="${serialId}"]`).check();
 
-    // Select actual xterm text by mouse, then open the menu (which must retain the original selection).
+    // Select actual xterm text before opening the assistant, then analyze it from the conversation.
+    await page.locator('#ai-collapse').click();
     await serialTab.click();
     const serialSurface = page.locator('#surface-' + serialId);
     const screen = await serialSurface.locator('.xterm-screen').boundingBox();
     await page.mouse.move(screen.x + 1, screen.y + 10); await page.mouse.down();
     await page.mouse.move(screen.x + Math.min(240, screen.width - 10), screen.y + 10, { steps: 8 }); await page.mouse.up();
-    await more('分析选中日志');
+    const selectionBefore = (await requests()).length;
+    await more('AI 助手');
+    assert.equal((await requests()).length, selectionBefore, 'opening the assistant never submits the selection');
+    await page.locator('#ai-read-selection').click();
     await until(async () => (await page.locator('.ai-assistant').count()) === 6, 'selected log reply');
     context = JSON.stringify((await requests()).at(-1).body.messages);
     assert(context.includes('选中日志') && context.includes('SERIAL_ONLY') && !context.includes('SERIAL_UPDATED'));
@@ -194,7 +205,7 @@ async function main() {
     const messageCount = await page.locator('.ai-message').count();
     await page.locator('#ai-collapse').click();
     await until(async () => (await page.locator('.terminal-area').boundingBox()).width > widthBefore, 'collapse restores width');
-    await more('AI 日志分析'); assert.equal(await page.locator('.ai-message').count(), messageCount);
+    await more('AI 助手'); assert.equal(await page.locator('.ai-message').count(), messageCount);
     await page.screenshot({ path: join(directory, 'ai-verified.png') });
     for (const filename of ['settings.json', 'sessions.json']) {
       const text = await readFile(join(directory, filename), 'utf8');

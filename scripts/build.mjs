@@ -1,5 +1,5 @@
 import { build } from 'esbuild';
-import { copyFile, mkdir } from 'node:fs/promises';
+import { copyFile, cp, mkdir } from 'node:fs/promises';
 import { buildLocalPty } from './windows-pty.mjs';
 import { buildWindowsIcon } from './windows-icon.mjs';
 
@@ -19,4 +19,5 @@ await Promise.all([
     loader: { '.woff2': 'file' }, assetNames: 'fonts/[name]-[hash]',
   }),
   copyFile('src/renderer/index.html', 'dist/index.html'),
+  cp('vendor/adb', 'dist/adb', { recursive: true }),
 ]);

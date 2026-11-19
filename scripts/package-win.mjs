@@ -14,8 +14,8 @@ if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('请
 const require = createRequire(import.meta.url);
 const release = resolve('release');
 const tools = resolve('.tools');
-const filename = `TermDock-${require('../package.json').releaseVersion}-win-x64.zip`;
-const maximumBytes = 20_000_000;
+const { releaseVersion, portableMaximumBytes } = require('../package.json');
+const filename = `TermDock-${releaseVersion}-win-x64.zip`;
 const nodeVersion = '22.23.4';
 const sdkVersion = '1.0.4314.35';
 const nodeHash = 'aa39a7741f62832ea50daba0113c8f8b12ccde226abca931326832d5bc47d31f';
@@ -122,7 +122,10 @@ try {
     cp(forms, join(portable, 'Microsoft.Web.WebView2.WinForms.dll')),
     cp(join(sdk, 'runtimes', 'win-x64', 'native', 'WebView2Loader.dll'), join(portable, 'WebView2Loader.dll')),
     cp('README.md', join(portable, 'README.md')),
+    cp('vendor/adb', join(backend, 'adb'), { recursive: true }),
+    cp('ACCEPTANCE.md', join(portable, 'ACCEPTANCE.md')),
     cp('ACCEPTANCE-0.0.3.md', join(portable, 'ACCEPTANCE-0.0.3.md')),
+    cp('ACCEPTANCE-0.0.4.md', join(portable, 'ACCEPTANCE-0.0.4.md')),
     cp('docs/0.0.3/layout-and-credentials.md', join(reportDirectory, 'layout-and-credentials.md')),
     writeFile(join(portable, 'Create-Start-Menu-Shortcut.cmd'), '@echo off\r\nstart "" "%~dp0TermDock.exe" --register-start-menu\r\n'),
     writeFile(join(portable, 'runtime.sha256'), nodeHash + '\n'),
@@ -141,6 +144,7 @@ try {
   await writeFile(join(portable, 'THIRD-PARTY-NOTICES.txt'), [
     'Node.js', await readFile(nodeLicense, 'utf8'), 'Microsoft WebView2 SDK',
     await readFile(join(sdk, 'LICENSE.txt'), 'utf8'), await readFile(join(sdk, 'NOTICE.txt'), 'utf8'),
+    'Android SDK Platform-Tools 29.0.5: see backend/adb/UPSTREAM-NOTICE.txt',
     'IBM Plex Mono', await readFile('src/renderer/fonts/OFL.txt', 'utf8'), ...notices,
   ].join('\n'));
   run(join(bin, 'package', 'win', 'x64', '7za.exe'), [
@@ -149,7 +153,7 @@ try {
   ], nodeDirectory);
   run('tar.exe', ['-a', '-cf', archive, 'TermDock'], stage);
   const { size } = await stat(archive);
-  if (size > maximumBytes) throw new Error(`便携包 ${size} 字节，超过 ${maximumBytes} 字节`);
+  if (size > portableMaximumBytes) throw new Error(`便携包 ${size} 字节，超过 ${portableMaximumBytes} 字节`);
   const hash = await digest(archive);
   await rename(archive, destination);
   await writeFile(destination + '.sha256', `${hash}  ${filename}\n`);

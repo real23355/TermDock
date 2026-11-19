@@ -3,14 +3,15 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import {
-  aiDefaults, aiSettingsSchema, commandGroupsSchema, defaults, preferencesSchema, profile, recentConnectionSchema,
+  adbDirectorySchema, adbPreferencesSchema, aiDefaults, aiSettingsSchema, commandGroupsSchema, defaults, preferencesSchema, profile, recentConnectionSchema,
   type CommandGroup, type Preferences, type Profile, type RecentConnection, type SavedProfile,
 } from '../shared';
 
 const settingsSchema = z.object({
   preferences: preferencesSchema,
   hosts: z.record(z.string(), z.string()),
-  ai: aiSettingsSchema.default(aiDefaults),
+  ai: aiSettingsSchema.default({ ...aiDefaults, models: [] }),
+  adb: adbPreferencesSchema.extend({ ownedPath: adbDirectorySchema.optional() }).default({ systemPath: false }),
 });
 const legacySettingsSchema = settingsSchema.extend({
   profiles: z.unknown().optional(),
@@ -78,7 +79,8 @@ export class Store {
 
     const savedSettings = readFile(this.settingsFile);
     const legacy = savedSettings === undefined ? undefined : validate(this.settingsFile, legacySettingsSchema, savedSettings);
-    this.settings = { preferences: legacy?.preferences ?? defaults, hosts: legacy?.hosts ?? {}, ai: legacy?.ai ?? aiDefaults };
+    this.settings = { preferences: legacy?.preferences ?? defaults, hosts: legacy?.hosts ?? {},
+      ai: legacy?.ai ?? { ...aiDefaults, models: [] }, adb: legacy?.adb ?? { systemPath: false } };
 
     const savedSessions = readFile(this.sessionsFile);
     const sessions = savedSessions === undefined
@@ -107,6 +109,8 @@ export class Store {
   get commandGroups() { return this.buttons.commandGroups; }
   get ai() { return this.settings.ai; }
   setAi(ai: z.infer<typeof aiSettingsSchema>) { this.updateSettings({ ai }); }
+  get adb() { return this.settings.adb; }
+  setAdb(adb: Settings['adb']) { this.updateSettings({ adb }); }
 
   private updateSessions(changes: Partial<Sessions>) {
     const sessions = { ...this.sessions, ...changes };

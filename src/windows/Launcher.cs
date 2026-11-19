@@ -285,6 +285,13 @@ internal sealed class TerminalWindow : Form
                     using (var folder = new FolderBrowserDialog { Description = "选择串口日志目录", ShowNewFolderButton = true })
                         Reply(id, folder.ShowDialog(this) == DialogResult.OK ? folder.SelectedPath : null);
                     return;
+                case "pick-adb-directory":
+                    var adbArgs = (System.Collections.IList)packet["args"];
+                    var adbTarget = (string)adbArgs[0];
+                    if (adbTarget != "tools" && adbTarget != "pull") throw new ArgumentException("文件夹用途无效");
+                    using (var folder = new FolderBrowserDialog { Description = adbTarget == "tools" ? "选择 ADB 工具目录" : "选择 ADB 文件保存目录", ShowNewFolderButton = true })
+                        Reply(id, folder.ShowDialog(this) == DialogResult.OK ? folder.SelectedPath : null);
+                    return;
                 case "pick-transfer-path":
                     var transferArgs = (System.Collections.IList)packet["args"];
                     if ((string)transferArgs[0] == "upload")
@@ -301,7 +308,7 @@ internal sealed class TerminalWindow : Form
                     return;
             }
             if (worker == null || worker.HasExited) throw new IOException(workerError ?? "TermDock 后台已退出");
-            if (name == "show-logs") logRequests.Add(id);
+            if (name == "show-logs" || name == "adb-open-directory") logRequests.Add(id);
             toWorker.Add(args.WebMessageAsJson);
         }
         catch (Exception error) { if (id > 0) Reject(id, error.Message); }

@@ -27,7 +27,7 @@ startWorker(process.argv[2], {
 }, { fetch: async (url, options) => {
   const body = JSON.parse(String(options?.body));
   record({ type: 'request', url: String(url), body, authenticated: (options?.headers as Record<string, string>).Authorization === 'Bearer portable-chat-fixture' });
-  const automatic = body.messages[0]?.content.includes('本轮用户已选择自动操作一个串口');
+  const automatic = body.messages[0]?.content.includes('本轮用户选择了 TermDock 串口操作');
   const steps = body.messages.filter((message: { role: string; content: string }) => message.role === 'assistant' && message.content.startsWith('{')).length;
   const plans = [
     { reply: '先查看内存', action: { type: 'send', text: 'free -m', lineEnding: 'CR', waitMs: 250 } },

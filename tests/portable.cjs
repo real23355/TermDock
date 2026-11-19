@@ -9,7 +9,7 @@ const { setTimeout: sleep } = require('node:timers/promises');
 const { promisify } = require('node:util');
 const { chromium } = require('playwright');
 const { Server } = require('ssh2');
-const { releaseVersion } = require('../package.json');
+const { releaseVersion, portableMaximumBytes } = require('../package.json');
 
 const exec = promisify(execFile);
 
@@ -34,7 +34,7 @@ async function listen(server) {
 async function main() {
   const archive = resolve(`release/TermDock-${releaseVersion}-win-x64.zip`);
   const { size } = await stat(archive);
-  assert(size <= 20_000_000);
+  assert(size <= portableMaximumBytes);
   const hash = createHash('sha256');
   for await (const bytes of createReadStream(archive)) hash.update(bytes);
   assert.equal(hash.digest('hex'), (await readFile(archive + '.sha256', 'utf8')).split(' ')[0]);
@@ -45,6 +45,7 @@ async function main() {
   assert.equal(result.status, 0);
   const profile = join(folder, 'profile');
   await mkdir(profile);
+  const configuredPull = join(folder, 'ADB 保存 目录');
   const legacySettings = {
     profiles: [{
       id: randomUUID(), name: '已有串口会话', kind: 'serial', path: 'COM77', baudRate: 115200,
@@ -52,6 +53,7 @@ async function main() {
     }],
     preferences: { font: 'Cascadia Mono', fontSize: 15, scrollback: 10000, gpu: true },
     hosts: { '[legacy.invalid]:22': 'SHA256:legacy' },
+    adb: { pullDirectory: configuredPull, systemPath: false },
     commandGroups: [{
       id: randomUUID(), name: '旧版按钮',
       buttons: [{ id: randomUUID(), name: '旧版查询', command: 'echo legacy', lineEnding: 'CR' }],
@@ -123,8 +125,9 @@ async function main() {
     page.on('pageerror', error => errors.push(error.message));
     page.setDefaultTimeout(8000);
     const click = async name => {
+      if (name === '连接') return page.locator('#connect-now').click();
       const button = page.getByRole('button', { name, exact: true });
-      if (!['重连', '交换窗格', '关闭分屏', 'Serial Break', '定时发送 / 重启测试'].includes(name)) return button.click();
+      if (!['交换窗格', '关闭分屏', 'Serial Break', '定时发送 / 重启测试'].includes(name)) return button.click();
       await page.locator('#top-more').click();
       return page.getByRole('menuitem', { name, exact: true }).click();
     };
@@ -316,6 +319,15 @@ async function main() {
     await page.keyboard.press('ArrowUp');
     await page.keyboard.press('Enter');
     await until(async () => (await shellText()).split('\r\ntermdock-ok\r\n').length >= 3, 'previous command via ArrowUp');
+    await enterPowerShell("(Get-Command adb -ErrorAction Stop).Source");
+    const defaultAdb = join(profile, 'tools', 'adb', 'adb.exe');
+    await findOutput(defaultAdb);
+    const adbPrefixStart = (await shellText()).length;
+    await page.locator('#adb-command').click();
+    await until(async () => (await shellText()).slice(adbPrefixStart).includes('adb '), 'ADB toolbar fills the command prefix');
+    assert(!(await shellText()).slice(adbPrefixStart).includes('Android Debug Bridge'));
+    await enterPowerShell('version');
+    await findOutput('Android Debug Bridge version 1.0.41');
     await page.keyboard.type('Write-Outpu');
     await page.keyboard.press('Tab');
     await page.keyboard.type(" ('TAB_' + 'OK')");
@@ -356,6 +368,7 @@ async function main() {
     await page.keyboard.press('Enter');
     const cmdTab = page.getByRole('tab', { name: 'CMD', exact: true });
     const cmd = page.locator('#' + await cmdTab.getAttribute('aria-controls'));
+    assert.equal(await page.locator('#adb-command').isVisible(), false);
     const cmdLog = join(await page.locator('.top-tools .session-logs').getAttribute('title'), 'session.log');
     await until(async () => {
       const log = await readFile(cmdLog, 'utf8');
@@ -390,15 +403,14 @@ async function main() {
     await page.keyboard.type(' CMD_END');
     await page.keyboard.press('Enter');
     await until(async () => (await readFile(cmdLog, 'utf8')).replace(/\x1b\[[0-?]*[ -/]*[@-~]|\r?\n/g, '')
-      .includes(`"${fixtures[0]}" "${fixtures[1]}" CMD_END`), 'quoted multi-file CMD input accepts further typing');
+      .includes(`${fixtures.join(' ')} CMD_END`), 'literal multi-file CMD input accepts further typing');
     await localTab.click();
     await page.keyboard.type('Write-Output ');
     await dragFiles(local);
-    await sleep(220);
-    await page.keyboard.type(" ('DROP_' + 'END')");
-    await page.keyboard.press('Enter');
+    await until(async () => (await shellText()).replace(/\r?\n/g, '').includes(fixtures.join(' ')), 'PowerShell receives the two unescaped absolute paths');
+    await page.keyboard.press('Control+c');
+    await enterPowerShell("Write-Output ('DROP_' + 'END')");
     await findOutput('DROP_END', true);
-    await findOutput(fixtures[1], true);
     await cmdTab.click();
     await click('左右分屏');
     const sshTab = page.getByRole('tab', { name: 'SSH', exact: true });
@@ -427,19 +439,34 @@ async function main() {
     await local.locator('.xterm-screen').click();
     await enterPowerShell("Write-Output ('SIDE_' + 'PANE')");
     await until(async () => (await readFile(localLog, 'utf8')).includes('SIDE_PANE'), 'input in side-by-side pane');
+    await cmd.locator('.xterm-screen').click();
+    await click('取消分屏');
+    assert.equal(await page.locator('.surface:visible').count(), 1);
+    assert.equal(await cmd.isVisible(), true);
+    await localTab.click();
+    await findOutput('SIDE_PANE');
     await click('上下分屏');
     await click('应用分屏');
     assert((await local.boundingBox()).y < (await cmd.boundingBox()).y);
     await enterPowerShell("Write-Output ('STACKED_' + 'PANE')");
     await until(async () => (await readFile(localLog, 'utf8')).includes('STACKED_PANE'), 'input in stacked pane');
-    await click('关闭分屏');
+    await cmd.locator('.xterm-screen').click();
+    await click('取消分屏');
     assert.equal(await page.locator('.surface:visible').count(), 1);
-    await page.getByRole('tab', { name: 'CMD', exact: true }).click();
+    assert.equal(await cmd.isVisible(), true);
+    await page.keyboard.type('echo STACK_CANCEL_KEPT_CMD');
+    await page.keyboard.press('Enter');
+    await until(async () => (await readFile(cmdLog, 'utf8')).includes('\r\nSTACK_CANCEL_KEPT_CMD'), 'cancelled split keeps CMD connection and focus');
     await localTab.click();
+    await findOutput('STACKED_PANE');
     await enterPowerShell('exit 7');
     await status('已断开');
     assert.match(await page.locator('#global-endpoint').textContent(), /7/);
     assert.equal((await readConfig('sessions.json')).recentConnections.length, 2);
+    await page.locator('#session-connection[aria-label="连接"]').click();
+    await page.getByRole('tab', { name: 'PowerShell', selected: true, exact: true }).waitFor();
+    await status('已连接');
+    assert.equal(await page.locator('#session-connection').getAttribute('aria-label'), '断开');
     console.log('Local PowerShell shortcut, interactive input, Ctrl+C, native PTY resize and exit passed');
 
     assert.deepEqual(errors, []);
@@ -466,26 +493,76 @@ async function main() {
     assert.equal(link.Target, executable);
     assert(link.Icon.startsWith(executable));
     assert.equal(link.AppId, 'TermDock.Desktop');
+    const configuredAdb = join(folder, 'ADB 工具 目录');
+    await page.locator('#settings').click();
+    await page.locator('#settings-adb-tab').click();
+    await until(async () => (await page.locator('#adb-directory').inputValue()) === join(profile, 'tools', 'adb'), 'initial ADB settings');
+    assert.deepEqual(await page.locator('#adb-settings-form button').allTextContents(), ['选择目录', '保存']);
+    // Supply the value that the native folder picker returns, then exercise the real Save IPC.
+    await page.locator('#adb-directory').evaluate((input, directory) => { input.value = directory; }, configuredAdb);
+    await page.locator('#adb-settings-form').getByRole('button', { name: '保存', exact: true }).click();
+    await page.waitForFunction(() => document.querySelector('#adb-status').textContent.includes('ADB 设置已保存'));
+    assert.deepEqual((await readConfig('settings.json')).adb, { directory: configuredAdb, pullDirectory: configuredPull, systemPath: false });
     await closeLauncher();
     launcher = launch();
     await until(() => fetch(endpoint + '/json/version', { signal: AbortSignal.timeout(400) }).then(r => r.ok, () => false), 'restarted launcher', 20000);
     const restarted = await chromium.connectOverCDP(endpoint);
     const reopenedPage = await until(() => restarted.contexts().flatMap(context => context.pages())
       .find(page => page.url() === 'https://termdock.local/index.html'), 'reopened application page');
+    await reopenedPage.locator('#settings').click();
+    await reopenedPage.locator('#settings-adb-tab').click();
+    await until(async () => (await reopenedPage.locator('#adb-directory').inputValue()) === configuredAdb, 'ADB tool directory persists after restart');
+    await reopenedPage.locator('#settings-dialog [data-dismiss]').first().click();
+    await reopenedPage.locator('#quick-local').click();
+    await reopenedPage.waitForFunction(() => document.querySelector('#global-state').textContent === '已连接');
+    const newLocalLog = join(await reopenedPage.locator('.top-tools .session-logs').getAttribute('title'), 'session.log');
+    const newShell = reopenedPage.locator('.surface:visible .xterm-helper-textarea');
+    await newShell.focus();
+    await reopenedPage.keyboard.type('(Get-Command adb -ErrorAction Stop).Source');
+    await reopenedPage.keyboard.press('Enter');
+    await until(async () => (await readFile(newLocalLog, 'utf8')).includes(join(configuredAdb, 'adb.exe')), 'new PowerShell resolves the configured ADB tool directory');
+    await reopenedPage.locator('#top-more').click();
+    const visibleMenu = reopenedPage.getByRole('menuitem');
+    assert.deepEqual((await visibleMenu.allTextContents()).filter(text => /AI|分析选中日志|ADB/.test(text)), ['ADB 命令', 'AI 助手']);
+    await visibleMenu.filter({ hasText: /^ADB 命令$/ }).click();
+    await reopenedPage.keyboard.type('version');
+    await reopenedPage.keyboard.press('Enter');
+    await until(async () => (await readFile(newLocalLog, 'utf8')).includes('Android Debug Bridge version 1.0.41'), 'ADB command from the more menu');
     const reopenedSsh = reopenedPage.locator('#profiles .profile-open').filter({ hasText: '测试 SSH 重命名' });
     await reopenedSsh.click();
     const reopenedForm = reopenedPage.locator('#connect-form');
     await reopenedForm.getByText('密码已保存', { exact: false }).waitFor();
     assert.equal(await reopenedForm.locator('[name=password]').inputValue(), '');
+    const savedPassword = reopenedForm.locator('#ssh-saved-secret');
+    assert.equal(await savedPassword.locator('output').textContent(), '••••••••');
+    await savedPassword.getByRole('button', { name: '显示' }).click();
+    await reopenedPage.waitForFunction(() => document.querySelector('#ssh-saved-secret output').textContent === 'replacement-fixture-password');
+    await savedPassword.getByRole('button', { name: '隐藏' }).click();
+    assert.equal(await savedPassword.locator('output').textContent(), '••••••••');
     await reopenedForm.getByRole('button', { name: '连接', exact: true }).click();
+    await reopenedPage.getByRole('tab', { name: '测试 SSH 重命名', selected: true, exact: true }).waitFor();
     await reopenedPage.waitForFunction(() => document.querySelector('#global-state').textContent === '已连接');
     assert.equal(passwordAttempts.at(-1), 'tester');
+    await reopenedPage.locator('#session-connection[aria-label="断开"]').click();
+    await reopenedPage.locator('#session-connection[aria-label="连接"]').click();
+    await reopenedForm.getByText('密码已保存', { exact: false }).waitFor();
+    assert.equal(await reopenedForm.locator('[name=host]').inputValue(), '127.0.0.1');
+    assert.equal(await reopenedForm.locator('[name=port]').inputValue(), String(sshPort));
+    assert.equal(await reopenedForm.locator('[name=username]').inputValue(), 'tester');
+    assert.equal(await reopenedForm.locator('[name=password]').inputValue(), '');
+    const reconnectAttempts = passwordAttempts.length;
+    await reopenedForm.getByRole('button', { name: '连接', exact: true }).click();
+    await until(() => passwordAttempts.length > reconnectAttempts, 'SSH connection toggle reuses saved credentials');
+    await reopenedPage.getByRole('tab', { name: '测试 SSH 重命名', selected: true, exact: true }).waitFor();
+    await reopenedPage.waitForFunction(() => document.querySelector('#global-state').textContent === '已连接');
     await reopenedSsh.click({ button: 'right' });
     await reopenedPage.locator('.context-menu').getByRole('button', { name: '设置 / 重命名…', exact: true }).click();
+    await savedPassword.getByRole('button', { name: '显示' }).click();
+    await reopenedPage.waitForFunction(() => document.querySelector('#ssh-saved-secret output').textContent === 'replacement-fixture-password');
     await reopenedForm.locator('[name=forgetPassword]').check();
     await reopenedForm.getByRole('button', { name: '保存', exact: true }).click();
     await until(async () => !(await readdir(credentialDir)).length, 'clear saved credential');
-    console.log('Recent/Saved session menus and drag, DPAPI replacement and restart, file drop, right-paste, split order and resize, launcher icon OK');
+    console.log('PowerShell and SSH connection toggle, DPAPI, ADB prefix/menu and custom PATH after restart, file drop, split and session migration OK');
     console.log(`Portable ZIP verified (${size} bytes), first-run runtime extracted (${runtimeSize} bytes), migration, native COM and SSH UI passed`);
   } finally {
     await closeLauncher();

@@ -9,6 +9,7 @@ import { errorText, Session, systemSerial, type SerialProvider } from './session
 import { Store } from './store';
 import { Credentials } from './credentials';
 import { createAi, type AiTransport } from './ai';
+import { AdbTools } from './adb';
 
 const uuid = z.string().uuid();
 const openSchema = z.object({ id: uuid, profile: sessionProfile, auth: authSchema.optional(), size: sizeSchema,
@@ -31,6 +32,7 @@ type Handler = (...args: unknown[]) => unknown;
 export function createController(directory: string, emit: (event: SessionEvent) => void, serial: SerialProvider = systemSerial, aiTransport?: AiTransport) {
   const store = new Store(directory);
   const credentials = new Credentials(directory);
+  const adb = new AdbTools(store, directory);
   const logRoot = join(directory, 'logs');
   const sessions = new Map<string, Session>();
   let quitting = false;
@@ -40,7 +42,10 @@ export function createController(directory: string, emit: (event: SessionEvent) 
     if (!session) throw new Error('会话已关闭');
     return session;
   }
-  const ai = createAi(store, credentials, aiTransport, { acquire: (id, runId, cancel) => requireSession(id).acquireAiSerial(runId, cancel), emit });
+  const ai = createAi(store, credentials, aiTransport, {
+    list: () => Array.from(sessions.values()).flatMap(session => session.aiSerialTarget ?? []),
+    acquire: (id, runId, cancel) => requireSession(id).acquireAiSerial(runId, cancel),
+  }, emit);
 
   const requests: Record<string, Handler> = {
     load: () => ({
@@ -59,12 +64,22 @@ export function createController(directory: string, emit: (event: SessionEvent) 
       }
       return credentials.status(config);
     },
+    'credential-reveal': value => credentials.get(sshProfile.parse(value)),
     'ai-settings': ai.settings,
     'ai-save': ai.save,
+    'ai-add-model': ai.addModel,
+    'ai-reveal-key': ai.revealKey,
     'ai-test': ai.test,
     'ai-chat': ai.chat,
     'ai-assist': ai.assist,
+    'ai-answer': ai.answer,
     'ai-cancel': ai.cancel,
+    'adb-settings': () => adb.settings(),
+    'adb-save': value => adb.save(value),
+    'adb-open-directory': () => adb.ready(),
+    'adb-detect': () => adb.detect(),
+    'adb-devices': () => adb.devices(),
+    'adb-pull': value => adb.pull(value),
     preferences: value => store.setPreferences(preferencesSchema.parse(value)),
     'save-command-groups': value => store.setCommandGroups(commandGroupsSchema.parse(value)),
     'run-command': (id, groupId, buttonId) => {
@@ -79,15 +94,21 @@ export function createController(directory: string, emit: (event: SessionEvent) 
     open: async value => {
       const request = openSchema.parse(value);
       const config = request.profile;
+      if (sessions.has(request.id) || quitting) throw new Error('无法打开新会话');
       if (config.kind === 'ssh' && request.useSavedPassword) {
         request.auth = { method: 'password', password: await credentials.get(config) };
       }
-      if (sessions.has(request.id) || quitting) throw new Error('无法打开新会话');
       if (config.kind === 'ssh' && request.rememberPassword && request.auth?.method === 'password') {
         if (!request.auth.password) throw new Error('请填写需要保存的 SSH 密码');
         await credentials.save(config, request.auth.password);
       }
-      if (quitting) throw new Error('应用正在关闭');
+      let adbDirectory: string | undefined;
+      let adbError: string | undefined;
+      if (config.kind === 'local' && (config.shell === 'powershell' || config.shell === 'pwsh') && process.platform === 'win32') {
+        try { adbDirectory = await adb.ready(); }
+        catch (error) { adbError = errorText(error); }
+      }
+      if (sessions.has(request.id) || quitting) throw new Error('无法打开新会话');
       sessions.set(request.id, new Session(request, store, logRoot, event => {
         emit(event);
         if (event.type !== 'connection' || config.kind === 'local') return;
@@ -98,7 +119,8 @@ export function createController(directory: string, emit: (event: SessionEvent) 
         } catch (error) {
           emit({ id: event.id, type: 'error', detail: `保存最近连接失败：${errorText(error)}` });
         }
-      }, serial));
+      }, serial, adbDirectory));
+      if (adbError) emit({ id: request.id, type: 'error', detail: adbError });
     },
     close: async id => {
       const session = requireSession(id);
@@ -147,6 +169,7 @@ export function createController(directory: string, emit: (event: SessionEvent) 
       ai.close();
       await Promise.allSettled([...sessions.values()].map(session => session.end()));
       await credentials.settled();
+      await adb.settled();
     },
   };
 }

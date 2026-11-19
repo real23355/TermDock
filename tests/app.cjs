@@ -163,8 +163,9 @@ async function main() {
       ([selector, expected]) => document.querySelector(selector)?.textContent?.includes(expected), [selector, expected], { timeout },
     );
     const click = async text => {
+      if (text === '连接') return page.locator('#connect-now').click();
       const button = page.getByRole('button', { name: text, exact: true });
-      if (!['重连', '交换窗格', '关闭分屏', 'Serial Break', '定时发送 / 重启测试'].includes(text)) return button.click();
+      if (!['交换窗格', '关闭分屏', 'Serial Break', '定时发送 / 重启测试'].includes(text)) return button.click();
       await page.locator('#top-more').click();
       return page.getByRole('menuitem', { name: text, exact: true }).click();
     };
@@ -452,8 +453,8 @@ async function main() {
     assert.equal((await sent()).toString(), 'reboot\rroot\rreboot\recho\rreboot\r\n');
     await electron.evaluate(() => globalThis.fixture.disconnect());
     await value('#global-state', '已断开');
-    await click('重连');
-    await click('连接');
+    await page.locator('#session-connection[aria-label="连接"]').click();
+    await page.locator('#connect-now').click();
     await value('#global-state', '已连接');
     await timerState('未开始');
     await start();

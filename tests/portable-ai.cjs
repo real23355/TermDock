@@ -67,7 +67,12 @@ async function main() {
     child = launch(); let page = await connect(); page.setDefaultTimeout(8000);
     const state = (selector, text) => page.waitForFunction(([selector, text]) => document.querySelector(selector)?.textContent.includes(text), [selector, text]);
     const configure = async () => { await page.locator('#settings').click(); await page.locator('#settings-ai-tab').click(); await until(() => page.locator('#ai-key-status').textContent().then(Boolean), 'AI settings loaded'); };
-    await configure(); await page.locator('#ai-model').fill('DeepSeek-V4.1-Flash-1017');
+    await configure();
+    const presetModels = page.locator('select#ai-model');
+    assert.deepEqual(await presetModels.locator('option').evaluateAll(options => options.map(option => option.value)), [
+      'GLM-5.3-Flash-NVFP4', 'DeepSeek-V4.1-Flash-1017',
+    ]);
+    await presetModels.selectOption('DeepSeek-V4.1-Flash-1017');
     await page.locator('#ai-key').fill('portable-fixture-key'); await page.locator('#ai-save').click(); await state('#ai-settings-status', '配置已保存');
     await page.locator('#ai-test').click(); await state('#ai-settings-status', '调用成功：OK');
     assert((await requests()).at(-1).authenticated);
@@ -82,7 +87,7 @@ async function main() {
       if (i === 0) { await page.locator('#key-dialog').waitFor(); await page.locator('#accept-key').click(); }
       await state('#global-state', '已连接');
     }
-    await page.locator('#top-more').click(); await page.getByRole('menuitem', { name: 'AI 日志分析', exact: true }).click();
+    await page.locator('#top-more').click(); await page.getByRole('menuitem', { name: 'AI 助手', exact: true }).click();
     assert.equal(await page.locator('#ai-sources input').count(), 2);
     const active = await page.locator('#tabs [aria-selected=true]').getAttribute('id');
     await page.locator('#ai-sources input').first().check();
@@ -93,12 +98,29 @@ async function main() {
     const context = JSON.stringify(req.body.messages);
     assert(context.includes('NATIVE_0_ONLY') && context.includes('NATIVE_1_ONLY'));
     assert.equal(await page.locator('#tabs [aria-selected=true]').getAttribute('id'), active);
+    const panelSecret = page.locator('#ai-panel-key-secret');
+    await state('#ai-current-key-status', '已保存');
+    assert.match(await panelSecret.locator('output').textContent(), /^[•●*]+$/);
+    await panelSecret.getByRole('button', { name: '显示', exact: true }).click();
+    await state('#ai-panel-key-secret output', 'portable-fixture-key');
+    await panelSecret.getByRole('button', { name: '隐藏', exact: true }).click();
     await page.screenshot({ path: join(folder, 'native-ai-verified.png') });
+    await configure();
+    await page.locator('#ai-model-add').click(); await page.locator('#ai-model-new').fill('  Native-Custom-Model  ');
+    await page.locator('#ai-model-confirm').click(); await state('#ai-settings-status', '已');
+    assert.equal(await page.locator('#ai-model').inputValue(), 'Native-Custom-Model');
     await close(); child = launch(); page = await connect();
     await configure(); await state('#ai-key-status', '已保存');
-    assert.equal(await page.locator('#ai-model').inputValue(), 'DeepSeek-V4.1-Flash-1017');
+    assert.equal(await page.locator('#ai-model').inputValue(), 'Native-Custom-Model');
+    assert.equal(await page.locator('#ai-model option[value="Native-Custom-Model"]').count(), 1);
     assert.equal(await page.locator('#ai-key').inputValue(), '');
+    const settingsSecret = page.locator('#ai-settings-key-secret');
+    assert.match(await settingsSecret.locator('output').textContent(), /^[•●*]+$/);
+    await settingsSecret.getByRole('button', { name: '显示', exact: true }).click();
+    await state('#ai-settings-key-secret output', 'portable-fixture-key');
     await page.locator('#ai-test').click(); await state('#ai-settings-status', '调用成功：OK');
+    assert.equal((await requests()).at(-1).body.model, 'Native-Custom-Model');
+    assert((await requests()).at(-1).authenticated);
     await page.locator('#ai-clear-key').click(); await state('#ai-settings-status', '已清除');
     assert(!(await readFile(join(profile, 'settings.json'), 'utf8')).includes('portable-fixture-key'));
     await close();

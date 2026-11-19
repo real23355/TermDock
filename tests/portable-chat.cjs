@@ -54,7 +54,13 @@ async function main() {
     assert(JSON.stringify(rows.find(row => row.type === 'request').body.messages).includes('NATIVE_READY_COM77'));
     await page.locator('#ai-mode').selectOption('serial'); await page.locator('#ai-serial-target').selectOption(ids[0]);
     await page.locator('#ai-question').fill('自动检查 COM77 内存与系统信息'); await page.locator('#ai-send').click();
-    await page.locator('#tab-' + ids[1]).click(); await state('#ai-status', '本轮结束：2 次实际写入');
+    const approval = page.locator('#ai-interaction').getByRole('button', { name: '允许本次' });
+    await approval.waitFor();
+    assert(!(await readRecords()).some(row => row.type === 'write'));
+    await approval.click();
+    await page.locator('#tab-' + ids[1]).click();
+    await approval.click();
+    await state('#ai-status', '本轮结束：2 次实际写入');
     rows = await readRecords();
     assert.deepEqual(rows.filter(row => row.type === 'write').map(row => [row.port, row.text]), [['COM77', 'free -m\r'], ['COM77', 'uname -a\n']]);
     const requests = rows.filter(row => row.type === 'request');

@@ -1,8 +1,9 @@
 {
   "name": "termdock",
   "productName": "TermDock",
-  "version": "0.0.3-1118",
-  "releaseVersion": "V0.0.3_1118",
+  "version": "0.0.4-1119",
+  "releaseVersion": "V0.0.4_1119",
+  "portableMaximumBytes": 22000000,
   "private": true,
   "description": "Windows SSH and serial terminal with reboot testing",
   "main": "dist/main.cjs",
@@ -18,6 +19,7 @@
     "test:ai": "npm run build && node tests/ai.cjs",
     "test:ai-chat": "npm run build && node tests/ai-chat.cjs && node tests/ai-serial.cjs",
     "test:compact": "npm run build && node tests/compact.cjs",
+    "test:adb": "node tests/adb.cjs",
     "test:portable-ai": "node tests/portable-ai.cjs",
     "test:portable-chat": "node tests/portable-chat.cjs"
   },

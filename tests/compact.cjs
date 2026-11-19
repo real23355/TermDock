@@ -97,9 +97,10 @@ async function main() {
     await sleep(250); await checks();
     assert((await page.locator('#command-button-list button').count()) < originalVisible);
     await page.locator('#top-more').click();
-    for (const name of ['SFTP', '端口转发', '日志', '左右分屏', '上下分屏', 'AI 日志分析']) {
+    for (const name of ['SFTP', '端口转发', '日志', '左右分屏', '上下分屏', '断开', 'AI 助手']) {
       assert.equal(await page.getByRole('menuitem', { name, exact: true }).isVisible(), true);
     }
+    assert.deepEqual((await page.getByRole('menuitem').allTextContents()).filter(text => /AI|分析选中日志|ADB/.test(text)), ['AI 助手']);
     await page.keyboard.press('Escape');
     const cdp = await page.context().newCDPSession(page);
     const metrics = [];
@@ -117,12 +118,24 @@ async function main() {
     await page.locator('#command-group').selectOption(groups[0].id); await sleep(100);
     await page.locator('#sidebar-toggle').click(); await sleep(100); await checks();
     await pane(ids[1]).locator('.xterm-helper-textarea').focus();
-    await page.locator('.top-tools .disconnect').click(); await state('已断开');
+    const connection = page.locator('#session-connection');
+    assert.equal(await connection.getAttribute('aria-label'), '断开');
+    await connection.click(); await state('已断开');
     assert(await electron.evaluate(() => globalThis.fixture.connectedPort('COM3')));
     assert(!await electron.evaluate(() => globalThis.fixture.connectedPort('COM12')));
+    assert.equal(await connection.getAttribute('aria-label'), '连接');
+    assert.equal(await connection.getAttribute('data-icon'), 'reconnect');
+    await connection.click();
+    assert.equal(await page.locator('#connect-form [name=path]').inputValue(), 'COM12');
+    await page.locator('#connect-now').click();
+    await until(() => electron.evaluate(() => globalThis.fixture.connectedPort('COM12')), 'same COM port reconnects');
+    await state('已连接');
+    assert((await page.locator('#active-endpoint').textContent()).includes('COM12'));
+    assert.equal(await connection.getAttribute('aria-label'), '断开');
+    assert(await electron.evaluate(() => globalThis.fixture.connectedPort('COM3')));
     assert.deepEqual(errors, []);
     await writeFile(join(directory, 'dpi-emulation.json'), JSON.stringify(metrics, null, 2));
-    console.log('Unified layout, COM3/COM12 + many tabs, current-pane toolbar/commands, ordered whole-button overflow, resize/group/sidebar changes and 100/125/150% renderer DPI emulation OK. Evidence: ' + directory);
+    console.log('Compact layout, unified AI menu, active-pane connection toggle, command overflow and 100/125/150% DPI emulation OK. Evidence: ' + directory);
   } finally { await electron.close(); }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

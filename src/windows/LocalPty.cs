@@ -23,6 +23,11 @@ internal static class LocalPty
             errors.AutoFlush = true;
             try
             {
+                if (args.Length == 2 && args[0] == "--adb-user-path")
+                {
+                    UserPath.Run(args[1]);
+                    return 0;
+                }
                 if (args.Length == 2 && (args[0] == "--protect" || args[0] == "--unprotect"))
                 {
                     using (var input = Console.OpenStandardInput())
